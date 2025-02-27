@@ -11,6 +11,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"flamingo.me/dingo"
@@ -334,6 +335,7 @@ func inspect(injector *dingo.Injector) {
 }
 
 type servemodule struct {
+	mu                sync.Mutex
 	router            *web.Router
 	server            *http.Server
 	eventRouter       flamingo.EventRouter
@@ -382,10 +384,15 @@ func serveProvider(module *servemodule, logger flamingo.Logger, handlerWrapper f
 		Use:   "serve",
 		Short: "Default serve command - starts on Port 3322",
 		Run: func(cmd *cobra.Command, args []string) {
-			module.server.Handler = module.router.Handler()
-			if handlerWrapper != nil {
-				module.server.Handler = handlerWrapper(module.server.Handler)
-			}
+			func() {
+				module.mu.Lock()
+				defer module.mu.Unlock()
+
+				module.server.Handler = module.router.Handler()
+				if handlerWrapper != nil {
+					module.server.Handler = handlerWrapper(module.server.Handler)
+				}
+			}()
 
 			err := module.listenAndServe()
 			if err != nil {
@@ -426,18 +433,25 @@ func (a *servemodule) listenAndServe() error {
 
 // Notify upon flamingo Shutdown event
 func (a *servemodule) Notify(ctx context.Context, event flamingo.Event) {
-	if _, ok := event.(*flamingo.ShutdownEvent); ok {
-		if a.server.Handler == nil {
-			// server not running, nothing to shut down
-			return
-		}
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		a.logger.Info("Shutdown server on ", a.server.Addr)
+	if _, ok := event.(*flamingo.ShutdownEvent); !ok {
+		return
+	}
 
-		err := a.server.Shutdown(ctx)
-		if err != nil {
-			a.logger.Error("unexpected error on server shutdown: ", err)
-		}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.server.Handler == nil {
+		// server not running, nothing to shut down
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	a.logger.Info("Shutdown server on ", a.server.Addr)
+
+	err := a.server.Shutdown(ctx)
+	if err != nil {
+		a.logger.Error("unexpected error on server shutdown: ", err)
 	}
 }

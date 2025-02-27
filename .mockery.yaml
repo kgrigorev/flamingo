@@ -22,3 +22,6 @@ packages:
   "flamingo.me/flamingo/v3/core/security/interface/middleware":
     interfaces:
       RedirectURLMaker:
+  "flamingo.me/flamingo/v3/framework/flamingo":
+    interfaces:
+      Logger:
