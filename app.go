@@ -11,10 +11,12 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
-	"flamingo.me/dingo"
 	"github.com/spf13/cobra"
+
+	"flamingo.me/dingo"
 
 	"flamingo.me/flamingo/v3/core/runtime"
 	"flamingo.me/flamingo/v3/core/zap"
@@ -27,6 +29,14 @@ import (
 )
 
 //go:generate go run github.com/vektra/mockery/v2@v2.52.2
+
+const (
+	FailedShutdownExitCode = 130
+)
+
+var (
+	ErrAppRun = errors.New("app run error")
+)
 
 type (
 	// Application contains a main flamingo application
@@ -74,7 +84,7 @@ func SetEagerSingletons(enabled bool) ApplicationOption {
 	}
 }
 
-// WithArgs sets the initial arguments different than os.Args[1:]
+// WithArgs sets the initial arguments different from os.Args[1:]
 func WithArgs(args ...string) ApplicationOption {
 	return func(config *Application) {
 		config.args = args
@@ -131,7 +141,7 @@ func NewApplication(modules []dingo.Module, options ...ApplicationOption) (*Appl
 	app.flagset.Var(&flamingoConfig, "flamingo-config", "add additional flamingo yaml config")
 	dingoInspect := app.flagset.Bool("dingo-inspect", false, "inspect dingo")
 
-	if err := app.flagset.Parse(app.args); err != nil && err != flag.ErrHelp {
+	if err := app.flagset.Parse(app.args); err != nil && !errors.Is(err, flag.ErrHelp) {
 		return nil, fmt.Errorf("app: parsing arguments: %w", err)
 	}
 
@@ -224,32 +234,55 @@ func App(modules []dingo.Module, options ...ApplicationOption) {
 		log.Fatal(err)
 	}
 	if err := app.Run(); err != nil {
+		if errors.Is(err, cmd.ErrGracefulShutdown) {
+			os.Exit(FailedShutdownExitCode)
+		}
+
 		log.Fatal(err)
 	}
 }
 
 // Run runs the Root Cmd and triggers the standard event
 func (app *Application) Run() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	injector, err := app.area.GetInitializedInjector()
 	if err != nil {
-		return fmt.Errorf("get initialized injector: %w", err)
+		return fmt.Errorf("%w: couldn't get initialized injector: %w", ErrAppRun, err)
 	}
 
 	i, err := injector.GetAnnotatedInstance(new(cobra.Command), "flamingo")
 	if err != nil {
-		return fmt.Errorf("app: get flamingo cobra.Command: %w", err)
+		return fmt.Errorf("%w: couldn't get flamingo cobra.Command: %w", ErrAppRun, err)
 	}
 
-	rootCmd := i.(*cobra.Command)
+	rootCmd, ok := i.(*cobra.Command)
+	if !ok {
+		return fmt.Errorf("%w: resolved type for root command is not *cobra.Command", ErrAppRun)
+	}
+
+	rootCmd.SetContext(ctx)
 	rootCmd.SetArgs(app.flagset.Args())
 
 	i, err = injector.GetInstance(new(eventRouterProvider))
 	if err != nil {
 		return fmt.Errorf("app: get eventRouterProvider: %w", err)
 	}
-	i.(eventRouterProvider)().Dispatch(context.Background(), new(flamingo.StartupEvent))
 
-	return rootCmd.Execute()
+	erp, ok := i.(eventRouterProvider)
+	if !ok {
+		return fmt.Errorf("%w: resolved type for event router provider is not eventRouterProvider", ErrAppRun)
+	}
+
+	erp().Dispatch(rootCmd.Context(), new(flamingo.StartupEvent))
+
+	err = rootCmd.Execute()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrAppRun, err)
+	}
+
+	return nil
 }
 
 func typeName(of reflect.Type) string {
@@ -334,6 +367,7 @@ func inspect(injector *dingo.Injector) {
 }
 
 type servemodule struct {
+	mu                sync.Mutex
 	router            *web.Router
 	server            *http.Server
 	eventRouter       flamingo.EventRouter
@@ -382,10 +416,16 @@ func serveProvider(module *servemodule, logger flamingo.Logger, handlerWrapper f
 		Use:   "serve",
 		Short: "Default serve command - starts on Port 3322",
 		Run: func(cmd *cobra.Command, args []string) {
-			module.server.Handler = module.router.Handler()
-			if handlerWrapper != nil {
-				module.server.Handler = handlerWrapper(module.server.Handler)
-			}
+
+			func() {
+				module.mu.Lock()
+				defer module.mu.Unlock()
+
+				module.server.Handler = module.router.Handler()
+				if handlerWrapper != nil {
+					module.server.Handler = handlerWrapper(module.server.Handler)
+				}
+			}()
 
 			err := module.listenAndServe()
 			if err != nil {
@@ -426,18 +466,25 @@ func (a *servemodule) listenAndServe() error {
 
 // Notify upon flamingo Shutdown event
 func (a *servemodule) Notify(ctx context.Context, event flamingo.Event) {
-	if _, ok := event.(*flamingo.ShutdownEvent); ok {
-		if a.server.Handler == nil {
-			// server not running, nothing to shut down
-			return
-		}
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		a.logger.Info("Shutdown server on ", a.server.Addr)
+	if _, ok := event.(*flamingo.ShutdownEvent); !ok {
+		return
+	}
 
-		err := a.server.Shutdown(ctx)
-		if err != nil {
-			a.logger.Error("unexpected error on server shutdown: ", err)
-		}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.server.Handler == nil {
+		// server not running, nothing to shut down
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	a.logger.Info("Shutdown server on ", a.server.Addr)
+
+	err := a.server.Shutdown(ctx)
+	if err != nil {
+		a.logger.Error("unexpected error on server shutdown: ", err)
 	}
 }
