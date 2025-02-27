@@ -28,18 +28,27 @@ import (
 
 //go:generate go run github.com/vektra/mockery/v2@v2.52.2
 
+const (
+	FailedShutdownExitCode = 130
+)
+
+var (
+	ErrAppRun = errors.New("app run error")
+)
+
 type (
 	// Application contains a main flamingo application
 	Application struct {
-		configDir       string
-		childAreas      []*config.Area
-		area            *config.Area
-		args            []string
-		routesModules   []web.RoutesModule
-		loggerModule    dingo.Module
-		defaultContext  string
-		eagerSingletons bool
-		flagset         *flag.FlagSet
+		configDir        string
+		childAreas       []*config.Area
+		area             *config.Area
+		args             []string
+		routesModules    []web.RoutesModule
+		loggerModule     dingo.Module
+		defaultContext   string
+		eagerSingletons  bool
+		flagset          *flag.FlagSet
+		errorHandlerFunc func(error)
 	}
 
 	// ApplicationOption configures an Application
@@ -74,10 +83,24 @@ func SetEagerSingletons(enabled bool) ApplicationOption {
 	}
 }
 
-// WithArgs sets the initial arguments different than os.Args[1:]
+// WithArgs sets the initial arguments different from os.Args[1:]
 func WithArgs(args ...string) ApplicationOption {
 	return func(config *Application) {
 		config.args = args
+	}
+}
+
+// WithErrorHandler sets function which will be executed after app.Run finishes with an error which will be returned from it
+func WithErrorHandler(errHandlerFunc func(err error)) ApplicationOption {
+	return func(config *Application) {
+		config.errorHandlerFunc = errHandlerFunc
+	}
+}
+
+// DefaultErrorHandler return exit code 130 if graceful shutdown of the application failed
+func DefaultErrorHandler(err error) {
+	if err != nil && errors.Is(err, cmd.ErrGracefulShutdown) {
+		os.Exit(FailedShutdownExitCode)
 	}
 }
 
@@ -111,10 +134,11 @@ func (i *arrayFlags) Set(value string) error {
 // NewApplication loads a new application for running the Flamingo application with the given modules, loaded configs etc
 func NewApplication(modules []dingo.Module, options ...ApplicationOption) (*Application, error) {
 	app := &Application{
-		configDir:      "config",
-		args:           os.Args[1:],
-		defaultContext: "root",
-		loggerModule:   new(zap.Module),
+		configDir:        "config",
+		args:             os.Args[1:],
+		defaultContext:   "root",
+		loggerModule:     new(zap.Module),
+		errorHandlerFunc: DefaultErrorHandler,
 	}
 
 	for _, option := range options {
@@ -131,7 +155,7 @@ func NewApplication(modules []dingo.Module, options ...ApplicationOption) (*Appl
 	app.flagset.Var(&flamingoConfig, "flamingo-config", "add additional flamingo yaml config")
 	dingoInspect := app.flagset.Bool("dingo-inspect", false, "inspect dingo")
 
-	if err := app.flagset.Parse(app.args); err != nil && err != flag.ErrHelp {
+	if err := app.flagset.Parse(app.args); err != nil && !errors.Is(err, flag.ErrHelp) {
 		return nil, fmt.Errorf("app: parsing arguments: %w", err)
 	}
 
@@ -249,7 +273,16 @@ func (app *Application) Run() error {
 	}
 	i.(eventRouterProvider)().Dispatch(context.Background(), new(flamingo.StartupEvent))
 
-	return rootCmd.Execute()
+	err = rootCmd.Execute()
+	if app.errorHandlerFunc != nil {
+		defer app.errorHandlerFunc(err)
+	}
+
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrAppRun, err)
+	}
+
+	return nil
 }
 
 func typeName(of reflect.Type) string {

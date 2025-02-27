@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -26,6 +27,11 @@ type (
 
 	// Module for DI
 	Module struct{}
+)
+
+var (
+	ErrCmdRun           = errors.New("command execution error")
+	ErrGracefulShutdown = errors.New("graceful shutdown error")
 )
 
 // Configure DI
@@ -59,13 +65,14 @@ func (m *Module) Configure(injector *dingo.Injector) {
 				Short:            "Flamingo " + config.Name,
 				TraverseChildren: true,
 				PersistentPostRunE: func(*cobra.Command, []string) error {
+					var err error
 					// shutdown through command that is finite (e.g. help command)
 					shutdownOnce.Do(func() {
-						shutdown(eventRouterProvider(), signals, shutdownComplete, logger)
+						err = shutdown(eventRouterProvider(), signals, shutdownComplete, logger)
 						<-shutdownComplete
 					})
 
-					return nil
+					return err
 				},
 				PersistentPostRun: func(cmd *cobra.Command, args []string) {
 					// shutdown through command that is finite (e.g. help command)
@@ -99,7 +106,7 @@ func (*Module) FlamingoLegacyConfigAlias() map[string]string {
 	return map[string]string{"cmd.name": "flamingo.cmd.name"}
 }
 
-func shutdown(eventRouter flamingo.EventRouter, signals <-chan os.Signal, complete chan<- struct{}, logger flamingo.Logger) {
+func shutdown(eventRouter flamingo.EventRouter, signals <-chan os.Signal, complete chan<- struct{}, logger flamingo.Logger) error {
 	logger.Info("start graceful shutdown")
 
 	stopper := make(chan struct{})
@@ -112,14 +119,16 @@ func shutdown(eventRouter flamingo.EventRouter, signals <-chan os.Signal, comple
 	select {
 	case <-signals:
 		logger.Info("second interrupt signal received, hard shutdown")
-		os.Exit(130)
+		return fmt.Errorf("%w: signal received", ErrGracefulShutdown)
 	case <-time.After(30 * time.Second):
 		logger.Info("time limit reached, hard shutdown")
-		os.Exit(130)
+		return fmt.Errorf("%w: shutdown timed out", ErrGracefulShutdown)
 	case <-stopper:
 		logger.Info("graceful shutdown complete")
 		complete <- struct{}{}
 	}
+
+	return nil
 }
 
 // Run the root command
