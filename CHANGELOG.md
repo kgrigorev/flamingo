@@ -1,5 +1,13 @@
 # Changelog
 
+## Version v3.13.1 (2025-03-21)
+
+### Chores and tidying
+
+- retry (c22e2698)
+- **deps:** bump github.com/go-jose/go-jose/v4 from 4.0.2 to 4.0.5 (#484) (a7e5d1d4)
+- make post run script available for both Run and RunE functions (#478) (7bbfff73)
+
 ## Version v3.13.0 (2025-02-17)
 
 ### Features
