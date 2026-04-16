@@ -31,7 +31,7 @@ type (
 	routesProvider    func() []RoutesModule
 	responderProvider func() *Responder
 
-	// Router represents actual implementation of ReverseRouter interface
+	// Router represents the actual implementation of ReverseRouter interface
 	Router struct {
 		base              *url.URL
 		external          *url.URL
@@ -58,6 +58,15 @@ const (
 	// FlamingoNotfound is the Controller name for 404 notfound
 	FlamingoNotfound = "flamingo.notfound"
 )
+
+func NewRouter() *Router {
+	return &Router{
+		eventRouter:    new(flamingo.DefaultEventRouter),
+		filterProvider: func() []Filter { return nil },
+		routesProvider: func() []RoutesModule { return nil },
+		logger:         flamingo.NullLogger{},
+	}
+}
 
 // Inject dependencies
 func (r *Router) Inject(

@@ -42,6 +42,8 @@ const (
 var (
 	// ErrAppRun is returned when an error occurs during app.Run()
 	ErrAppRun = errors.New("app run error")
+
+	_ http.Handler = new(Application)
 )
 
 type (
@@ -291,7 +293,7 @@ func (app *Application) Run() error {
 	return nil
 }
 
-// HTTPHandler -
+// HTTPHandler returns an http.Handler with wired routes and handlers
 func (app *Application) HTTPHandler() (http.Handler, error) {
 	injector, err := app.area.GetInitializedInjector()
 	if err != nil {
@@ -309,6 +311,20 @@ func (app *Application) HTTPHandler() (http.Handler, error) {
 	}
 
 	return handler, nil
+}
+
+// ServeHTTP makes Application to a valid http.Handler
+func (app *Application) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if app == nil {
+		return
+	}
+
+	handler, err := app.HTTPHandler()
+	if err != nil {
+		return
+	}
+
+	handler.ServeHTTP(writer, request)
 }
 
 func typeName(of reflect.Type) string {
