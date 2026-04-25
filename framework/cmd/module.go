@@ -57,11 +57,25 @@ func RootCommandProvider(
 	},
 ) *cobra.Command {
 	var (
-		// declaring global context.CancelFunc and error to be used from both PersistentPreRun and PersistentPostRunE
-		stop             context.CancelFunc
-		err              error
-		execShutdownOnce = sync.OnceFunc(func() {
-			err = shutdown(logger, eventRouterProvider())
+		// declaring global signal cleanup and shutdown error to be used from both PersistentPreRun and PersistentPostRunE
+		stopSignals       context.CancelFunc
+		err               error
+		forcedShutdownCh  chan struct{}
+		rawSignals        chan os.Signal
+		stopSignalWatcher chan struct{}
+		execShutdownOnce  = sync.OnceFunc(func() {
+			err = shutdown(logger, eventRouterProvider(), forcedShutdownCh)
+		})
+		cleanupSignalOnce = sync.OnceFunc(func() {
+			if stopSignalWatcher != nil {
+				close(stopSignalWatcher)
+			}
+			if rawSignals != nil {
+				signal.Stop(rawSignals)
+			}
+			if stopSignals != nil {
+				stopSignals()
+			}
 		})
 	)
 
@@ -71,34 +85,49 @@ func RootCommandProvider(
 		TraverseChildren: true,
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			var ctx context.Context
-			ctx, stop = signal.NotifyContext(cmd.Context(), signals...)
+			ctx, stopSignals = signal.NotifyContext(cmd.Context(), signals...)
 			cmd.SetContext(ctx)
 
+			forcedShutdownCh = make(chan struct{}, 1)
+			rawSignals = make(chan os.Signal, len(signals))
+			stopSignalWatcher = make(chan struct{})
+			signal.Notify(rawSignals, signals...)
+
 			go func() {
-				// if in the serve command wait for signal to come (context will be cancelled),
-				// then disable listening for signals (calling stop())
-				// then execute shutdown func
-				<-cmd.Context().Done()
+				signalCount := 0
+				for {
+					select {
+					case <-rawSignals:
+						signalCount++
+						if signalCount < 2 {
+							continue
+						}
 
-				if stop != nil {
-					stop()
+						select {
+						case forcedShutdownCh <- struct{}{}:
+						default:
+						}
+					case <-stopSignalWatcher:
+						return
+					}
 				}
+			}()
 
+			go func() {
+				<-ctx.Done()
 				execShutdownOnce()
+				cleanupSignalOnce()
 			}()
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-			// on finished command execution
-			// stop listening for signals by calling stop()
-			// wait for context to be cancelled (should happen immediately after stop())
-			// execute shutdown func
-			if stop != nil {
-				stop()
+			// on finished command execution stop signal-aware context,
+			// execute shutdown exactly once and clean up signal handlers
+			if stopSignals != nil {
+				stopSignals()
 			}
 
-			<-cmd.Context().Done()
-
 			execShutdownOnce()
+			cleanupSignalOnce()
 
 			return err
 		},
@@ -125,18 +154,15 @@ func (*Module) FlamingoLegacyConfigAlias() map[string]string {
 	return map[string]string{"cmd.name": "flamingo.cmd.name"}
 }
 
-// shutdown wait for context ctx to be done and dispatches shutdown event
-func shutdown(logger flamingo.Logger, eventRouter flamingo.EventRouter) error {
+// shutdown dispatches the shutdown event and watches for a forced shutdown request
+func shutdown(logger flamingo.Logger, eventRouter flamingo.EventRouter, forcedShutdown <-chan struct{}) error {
 	logger.Info("start graceful shutdown")
 
 	var (
 		group   *errgroup.Group
-		sigch   = make(chan os.Signal, 1)
 		stopper = make(chan struct{})
 		timeout = 30 * time.Second
 	)
-
-	signal.Notify(sigch, signals...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -153,7 +179,7 @@ func shutdown(logger flamingo.Logger, eventRouter flamingo.EventRouter) error {
 
 	group.Go(func() error {
 		select {
-		case <-sigch:
+		case <-forcedShutdown:
 			logger.Info("second interrupt signal received, hard shutdown")
 			return fmt.Errorf("%w: signal received", ErrGracefulShutdown)
 		case <-ctx.Done():
