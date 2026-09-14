@@ -43,6 +43,10 @@ Note: the `Makefile` `test` target is stale (calls `golint`); use the commands a
 - Every module directory has a `Readme.md` starting with an h1 title; docs in `docs/` are numbered markdown rendered to docs.flamingo.me.
 - `framework/testutil` (PACT) and `core/cache` are deprecated; do not extend them.
 
+## Writing Go code
+
+Before writing, modifying, or refactoring `.go` files, use the `use-modern-go` skill (`.claude/skills/use-modern-go/`) to check for idiomatic patterns for this repo's Go version (from `go.mod`). Call its wrapper's `list` subcommand for the file being edited, and `explain <id>` before skipping a guideline it flags as applicable.
+
 ## Architecture
 
 ### Bootstrap (`app.go`)
