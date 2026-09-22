@@ -109,6 +109,9 @@ func TestCmdEventsTriggeredProperly(t *testing.T) { //nolint:paralleltest // due
 	}
 }
 
+// buildSignalSender returns a func sending SIGINT to the current process.
+// Delivery is asynchronous: wait until the signal has been observed (e.g. via cmd.Context().Done())
+// before relying on it, otherwise it may only arrive once graceful shutdown runs and count as a second interrupt.
 func buildSignalSender(t *testing.T) func() {
 	t.Helper()
 
@@ -133,7 +136,7 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 		name                string
 		args                string
 		onServerStartup     func()
-		onShutdown          func()
+		onShutdown          func(ctx context.Context)
 		insideCommandRun    func(cmd *cobra.Command, args []string)
 		insideCommandRunE   func(cmd *cobra.Command, args []string) error
 		wantErr             assert.ErrorAssertionFunc
@@ -143,7 +146,7 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 			name:                "serve command interrupted by SIGINT triggers graceful shutdown",
 			args:                "serve",
 			onServerStartup:     sync.OnceFunc(buildSignalSender(t)),
-			onShutdown:          func() {},
+			onShutdown:          func(context.Context) {},
 			wantErr:             assert.NoError,
 			assertShutdownCount: assertShutdownOnce,
 		},
@@ -152,8 +155,9 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 			args: "test_cmd_run",
 			insideCommandRun: func(cmd *cobra.Command, args []string) {
 				buildSignalSender(t)()
+				<-cmd.Context().Done()
 			},
-			onShutdown:          func() {},
+			onShutdown:          func(context.Context) {},
 			wantErr:             assert.NoError,
 			assertShutdownCount: assertShutdownOnce,
 		},
@@ -162,10 +166,11 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 			args: "test_cmd_run_e",
 			insideCommandRunE: func(cmd *cobra.Command, args []string) error {
 				buildSignalSender(t)()
+				<-cmd.Context().Done()
 
 				return nil
 			},
-			onShutdown:          func() {},
+			onShutdown:          func(context.Context) {},
 			wantErr:             assert.NoError,
 			assertShutdownCount: assertShutdownOnce,
 		},
@@ -173,17 +178,16 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 			name: "graceful shutdown interrupted by SIGINT forces hard shutdown",
 			args: "test_cmd_run",
 			insideCommandRun: func(cmd *cobra.Command, args []string) {
-				send := buildSignalSender(t)
-				send()
-				time.Sleep(time.Millisecond)
-				send()
+				buildSignalSender(t)()
+				<-cmd.Context().Done()
 			},
-			onShutdown: sync.OnceFunc(func() {
-				// artificial delay, so that second interrupt could arrive
-				time.Sleep(time.Second)
-			}),
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				return assert.ErrorIs(t, err, cmd.ErrGracefulShutdown)
+			onShutdown: func(ctx context.Context) {
+				// graceful shutdown is in progress while the event is handled, ctx is canceled by the hard shutdown
+				buildSignalSender(t)()
+				<-ctx.Done()
+			},
+			wantErr: func(t assert.TestingT, err error, i ...any) bool {
+				return assert.ErrorIs(t, err, cmd.ErrGracefulShutdown) && assert.ErrorContains(t, err, "signal received")
 			},
 			assertShutdownCount: assertShutdownOnce,
 		},
@@ -193,14 +197,14 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 			name: "graceful shutdown timed out forces hard shutdown",
 			args: "test_cmd_run",
 			insideCommandRun: func(cmd *cobra.Command, args []string) {
-				send := buildSignalSender(t)
-				send()
+				buildSignalSender(t)()
+				<-cmd.Context().Done()
 			},
-			onShutdown: sync.OnceFunc(func() {
+			onShutdown: func(context.Context) {
 				time.Sleep(35 * time.Second)
-			}),
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				return assert.ErrorIs(t, err, cmd.ErrGracefulShutdown)
+			},
+			wantErr: func(t assert.TestingT, err error, i ...any) bool {
+				return assert.ErrorIs(t, err, cmd.ErrGracefulShutdown) && assert.ErrorContains(t, err, "timed out")
 			},
 			assertShutdownCount: assertShutdownOnce,
 		},
@@ -237,7 +241,7 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 									tt.onServerStartup()
 								case *framework.ShutdownEvent:
 									shutdownEventCount.Add(1)
-									tt.onShutdown()
+									tt.onShutdown(ctx)
 								}
 							}))
 				}),
