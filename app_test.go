@@ -109,9 +109,9 @@ func TestCmdEventsTriggeredProperly(t *testing.T) { //nolint:paralleltest // due
 	}
 }
 
-// buildSignalSender returns a func sending SIGINT to the current process.
-// Delivery is asynchronous: wait until the signal has been observed (e.g. via cmd.Context().Done())
-// before relying on it, otherwise it may only arrive once graceful shutdown runs and count as a second interrupt.
+// buildSignalSender returns a function that sends SIGINT to the test process.
+// The signal does not arrive right away. Wait for it (e.g. <-cmd.Context().Done()) before moving on,
+// otherwise it may arrive during shutdown and count as a second interrupt.
 func buildSignalSender(t *testing.T) func() {
 	t.Helper()
 
@@ -182,7 +182,8 @@ func TestGracefulShutdown(t *testing.T) { //nolint:paralleltest // due to dingo.
 				<-cmd.Context().Done()
 			},
 			onShutdown: func(ctx context.Context) {
-				// graceful shutdown is in progress while the event is handled, ctx is canceled by the hard shutdown
+				// Shutdown is already running, so this SIGINT counts as the second one.
+				// Wait until the hard shutdown cancels ctx, so the graceful shutdown can't finish first.
 				buildSignalSender(t)()
 				<-ctx.Done()
 			},
