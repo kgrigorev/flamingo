@@ -9,10 +9,12 @@ Status: proposal
 - The safety net ships first, in **v3.N** on CUE v0.0.15: a `.cue` file that fails to load stops the boot instead of
   being silently ignored, and `config snapshot` records every config key with its Go type and a hashed value.
 - **v4.0.0** ports the Go API and adds guards that reproduce v3 results: a package clause on generated files and
-  module schemas, decoding through JSON (numbers stay `float64`), and a null-override check. It is accepted only if
-  it reproduces the v3.N golden snapshots exactly.
+  module schemas, decoding through JSON (numbers stay `float64`), v3's text for numbers in interpolations, a
+  null-override check, a merge error for later-file references that v3 did not resolve, and v3 module paths accepted
+  in `flamingo.modules.disabled`. It is accepted only if it reproduces the v3.N golden snapshots exactly.
 - Users convert their `.cue` files with `config cue-migrate`, which ships in **v3.M**. They then compare a v3 snapshot
-  with a v4 snapshot for each deployed context. Rollback is a revert of one commit.
+  with a v4 snapshot for each deployed context. Rollback is a revert of one commit, plus pointing `CONTEXTFILE` back at
+  the v3 copies of externally mounted files.
 
 These placeholders are used here and in the [user guide](cue-migration-guide.md):
 
@@ -34,9 +36,12 @@ Porting the Go code is small. The risk is configuration that keeps loading but m
 - Most removed syntax has a **dual-valid** spelling: v0.0.15 and v0.17.1 both accept it with identical results. That
   syntax can be migrated on v3. Definitions (`Foo ::` → `#Foo:`) and a few rare constructs have no dual-valid
   spelling and change at the cutover.
-- Four behaviour changes would be silent without a guard, and each gets one: dropped `.cue` files, a null overriding
-  a schema default, non-concrete top-level values decoding to nil, and integer types inside lists. Every other
-  difference fails loudly at boot.
+- Seven behaviour changes would be silent without a guard, and each gets one: dropped `.cue` files, a null
+  overriding a schema default, non-concrete top-level values decoding to nil, integer types inside lists, the text of
+  YAML numbers in CUE interpolations, references in later user files that v3 did not resolve, and
+  `flamingo.modules.disabled` entries that still name a v3 module path. Every other difference in a configuration
+  that loads on v3 fails loudly at boot. A few things that v3 rejects are accepted by v4 (see
+  [What this plan cannot catch](#what-this-plan-cannot-catch)).
 
 ## Scope and non-goals
 
@@ -75,8 +80,9 @@ Porting the Go code is small. The risk is configuration that keeps loading but m
   7. `Area.GetInitializedInjector` binds every key into Dingo by Go type. Integral `float64` values are also bound as
      `int` and `int64`.
 - **Hidden failures.** `loadLogged` discards every `.cue` load error, parse errors included, unless
-  `--flamingo-config-log` is set. `loadCueFile` treats any open error as "no file". A `CONTEXTFILE` entry that
-  matches no file is ignored. `Area.Flat()` discards the load errors of child areas.
+  `--flamingo-config-log` is set. `loadCueFile` treats any open error as "no file". The loader strips the extension
+  of each `CONTEXTFILE` entry and loads both `<entry>.yml` (or `.yaml`) and `<entry>.cue`; an entry that matches no
+  file is ignored. `Area.Flat()` discards the load errors of child areas.
 - **Coverage.** 15 test files use `config.TryModules`, which runs build, fill and decode. 5 use `dingo.TryModule`,
   which never evaluates `CueConfig()`. 9 of the 20 packages that define a `CueConfig()` have no `config.TryModules`
   test: the root package (`servemodule`), `framework`, `framework/cmd`, `framework/prefixrouter`,
@@ -85,9 +91,9 @@ Porting the Go code is small. The risk is configuration that keeps loading but m
 ## Target state
 
 v4.0.0 runs on CUE v0.17.1. For every configuration that loads on v3.N, it yields the same keys, values and Go types,
-or it fails at boot with a positioned error. Four checks enforce this continuously: golden snapshots, a
-null-override parity table, a per-module schema probe, and a scheduled job against the latest CUE release. The
-scheduled job replaces today's manual freeze on CUE upgrades.
+or it fails at boot with an error that names the file position or the config key. Four checks enforce this
+continuously: golden snapshots, a null-override parity table, a per-module schema probe, and a scheduled job against
+the latest CUE release. The scheduled job gives early warning when a new CUE release changes results.
 
 ## What changes
 
@@ -123,6 +129,7 @@ no older evaluator can be selected.
 | `/* … */` | `// …` (moved to the line before) | v0.1.0 | `cue fmt` v0.0.15 |
 | `{"\(k)": v for k, v in s}`, `{y: 1 if c}` | `{for k, v in s {"\(k)": v}}`, `{if c {y: 1}}` | v0.2.0 | `cue fmt` v0.0.15 |
 | `if` on an unset optional field (schemas) | a default, or a disjunction as in prefixrouter below | v0.1.0 | by hand |
+| `` `a-b`: v ``, references `` `a-b` ``, `` y.`a-b` `` (backquoted labels) | `X="a-b": v` with references `X`, or `y["a-b"]`; a backquoted identifier such as `` `c` `` becomes `c` | v0.4.3 | `config cue-migrate` (`cue fmt` v0.0.15 only unquotes identifiers) |
 
 **Version-locked constructs** have no practical dual-valid form, so they are converted at the cutover.
 
@@ -130,43 +137,49 @@ no older evaluator can be selected.
 | --- | --- | --- | --- | --- |
 | `Foo :: {…}`, references `Foo`, `a.Foo` | `#Foo: {…}`, `#Foo`, `a.#Foo` | `expected operand, found ':'` | semantics v0.3.0, parser v0.5.0 | `config cue-migrate` |
 | `[x*2 for x in y]` | `[for x in y {x*2}]` | `expected ']', found 'for'` | evaluation v0.3.0, parser v0.4.0 | `config cue-migrate` |
-| `X = 3` alias | `let X = 3` | `expected label or ':', found 'IDENT' …` | evaluation v0.4.0, parser v0.5.0 | `config cue-migrate` |
+| `X = 3` alias | `let X = 3` | `expected label or ':', found …` (the token after the alias) | evaluation v0.4.0, parser v0.5.0 | `config cue-migrate` |
 | `a div b` (`mod`, `quo`, `rem`) | `div(a, b)` | `missing ',' in struct literal` | v0.17.0 | `config cue-migrate` |
-| `[1] + [2]`, `2 * [1]` | `list.Concat(…)`, `list.Repeat(…)` | `Addition of lists is superseded by list.Concat` | v0.11.0 | `cue fix` v0.17.1 (literal operands) |
+| `[1] + [2]`, `2 * [1]` | `list.Concat(…)`, `list.Repeat(…)` | `Addition of lists is superseded by list.Concat`, `Multiplication of lists is superseded by list.Repeat` | v0.11.0 | `cue fix` v0.17.1 (literal operands) |
 
 - **No dual-valid definitions.** No dual-valid spelling of a definition keeps its reference path. A hidden field with
   `close()` (`_http`) is valid on both versions, but it renames the path and loses recursive closedness (decision 9).
-- **v4-only syntax on v3.** v0.0.15 cannot parse `#Foo`, `[for …]`, `let`, `a!:`, declaration attributes, or the
-  `div()` and `list.Concat`/`Repeat`/`Sort` builtins. Before v3.N, v3 **silently drops** a file that contains them.
+- **v4-only syntax on v3.** v0.0.15 cannot parse `#Foo`, `[for …]`, `let`, `a!:` or declaration attributes. Before
+  v3.N, v3 **silently drops** a file that contains them. The `div()` and `list.Concat`/`Repeat`/`Sort` builtins parse,
+  but fail loudly on every v3 release.
 - **No useful intermediate version.** Only v0.2.0 to v0.2.2 evaluate both `::` and `#` with v0.0.15 semantics. Those
   releases already reject space-separated labels, templates and block comments, and their `cue fix` is defective
   (decision 10).
 
-**Same text, different result.** All of these are loud on v4 except the last one:
+**Same text, different result.** The first three are loud on v4. The last two are accepted by v4 where v3 rejects
+them:
 
 - **Closedness inside `if` blocks.** A definition or `close()` value introduced inside `if` is enforced on v0.17.1 but
   not on v0.0.15, whatever the spelling. For example, YAML typos under
   `commerce.checkout.placeorder.contextstore.redis` or `commerce.product.fakeservice.sorting[*]` boot on v3 and fail
   on v4 with `field not allowed`.
-- **Wrong-typed `if` guards.** A field used as an `if` guard with a value of the wrong type (`enabled: "yes"`) is
-  silently kept by v3 and rejected by v4.
+- **Wrong-typed `if` guards.** The guard of a top-level `if` with a value of the wrong type (`enabled: "yes"`) is
+  silently kept by v3 and rejected by v4. In flamingo and flamingo-commerce this is only prefixrouter, which v3.N
+  already makes loud. Guards inside a struct fail on v3 too.
 - **Nested `close()` merged through embedding.** v4 rejects it with `field not allowed`.
-- **Package clauses in user files.** A user `.cue` file with `package flamingo` fails on v3 and loads on v4. Any
-  other package name fails on both.
+- **Package clauses in user files.** In the first user file that is merged (usually `config.cue`),
+  `package flamingo` fails on v3 and loads on v4, and any other package name fails on both. The `.cue` merge drops
+  package clauses of later user files on both versions.
 - **Silent: lost validation.** `v: #A; z: v.c & {zz: 1}` is rejected by v0.0.15 and accepted by v0.17.1. See
   [What this plan cannot catch](#what-this-plan-cannot-catch).
 
 ### Semantic changes and guards
 
-The v4 decode does not use native `Value.Decode`. It runs `Validate(cue.Concrete(true))`, formatting any error with
-`errors.Details`, then `MarshalJSON`, then `json.Unmarshal` into `config.Map`.
+The v4 decode does not use native `Value.Decode`. It runs `MarshalJSON`, then `json.Unmarshal` into `config.Map`.
 
 | Change | Trigger | v3 | v4 without guard | Guard | Residual risk |
 | --- | --- | --- | --- | --- | --- |
 | Unloadable `.cue` file | Parse error (legacy syntax on v4, v4 syntax on v3, typos), unreadable file, or a `CONTEXTFILE` entry with no file | Silently skipped; the app boots without that file's values | Same | Strict loading: v3.N (with an opt-out) and v4.0.0 (without) | v3 users who set `--flamingo-config-lenient`; each skipped file is logged |
-| Null over a schema default | YAML null on a key whose schema has a default: unquoted `%%ENV:X%%` with X unset or empty, `~`, or `null` | Boot error for scalar and struct defaults; `[]` for a non-empty list default | The default is used silently: 35 defaulted keys without a legacy alias in flamingo (e.g. `flamingo.router.notfound`, `core.serve.port`), 40 in flamingo-commerce (e.g. `commerce.pagination.defaultPageSize`), and list defaults (`commerce.product.fakeservice.deliveryCodes: ~`). Keys with a legacy alias, such as `flamingo.session.secret`, fail in `checkLegacyConfig` instead | Null-override check (below) | None for any schema shape in flamingo or flamingo-commerce. The hypothetical `{a: string \| *"x"} \| *{a: "y"}` fails where v3 booted, which is loud |
-| Non-concrete top-level value | A top-level user `.cue` field that is not concrete: an unmigrated reference `H: core.auth.http & {…}`, `T: string`, or conflicting top-level defaults | Load error | Decodes to nil, and `Get` reports the key as present | Validate plus JSON decode fail with the position | None observed |
+| Null over a schema default | YAML null on a key whose schema has a default: unquoted `%%ENV:X%%` with X unset or empty, `~`, or `null` | Boot error for scalar and struct defaults; `[]` for a non-empty list default | The default is used silently: dozens of defaulted keys without a legacy alias in flamingo (e.g. `flamingo.router.notfound`, `core.serve.port`) and in flamingo-commerce (e.g. `commerce.pagination.defaultPageSize`), and list defaults (`commerce.product.fakeservice.deliveryCodes: ~`). Keys with a legacy alias, such as `flamingo.session.secret`, fail in `checkLegacyConfig` instead | Null-override check (below) | None for any schema shape in flamingo or flamingo-commerce. The hypothetical `{a: string \| *"x"} \| *{a: "y"}` fails where v3 booted, which is loud |
+| Non-concrete top-level value | A top-level user `.cue` field that is not concrete: an unmigrated reference `H: core.auth.http & {…}`, `T: string`, or conflicting top-level defaults | Load error | Decodes to nil, and `Get` reports the key as present | The JSON decode fails with the position | None observed |
 | Integer Go types | Numbers from CUE inside lists (literals, schema defaults) | `float64` | `int64` inside `config.Slice`; scalars are re-normalised by `Map.Add` | JSON decode | None observed |
+| Number text | A YAML, environment or Go-default number used in a CUE interpolation or computed label, e.g. `"http://localhost:\(core.serve.port)/"` with port 8080 | `http://localhost:8080/` | `http://localhost:8.08E+3/`: integral values that end in 0 print in exponent form | Every `float64` of the merged map, list elements included, is filled as a CUE float literal with v3's digits: `%g`, plus `e0` when that has no `.` or exponent (2.4) | None observed |
+| Later-file references | In `config_<context>.cue`, `config_local.cue` or a `CONTEXTFILE` file, a reference to a struct label that the file declares and an earlier file declares too, e.g. `k: *flamingo.os.env.X \| "d"` in a file that also sets a `flamingo:` key | Fails with `undefined field`, or silently yields the disjunction default, `{}` for a comprehension, or nothing for an `if` | Resolves the reference when a module schema declares the label, which is the usual case | The merge rejects the reference with `ErrLaterFileReference` (2.2); the `config cue-migrate` dry run reports it on v3.M | None observed |
+| Module path in config | A `flamingo.modules.disabled` entry written for v3 (`flamingo.me/flamingo/v3/…Module`), or for a dependency that moved to a new major version | The module is disabled | The entry matches no module, and the module stays enabled without a message | Entries are matched ignoring path elements of the form `vN`; a match that is not exact, and an entry that matches no module, log a warning (2.1). v3 and v4 read the same YAML | A module that moved to another package path stays enabled, as on v3, now with a warning |
 
 **Null-override check.** It runs after `FillPath`, for each key whose merged Go value is nil. That is the same set
 that purgeNil marks.
@@ -175,7 +188,7 @@ that purgeNil marks.
 | --- | --- | --- |
 | none, no default, or default `null` | keep null | already equal |
 | open list with only an implicit default (`[...T]`, `[x, ...T]`) | keep | already equal |
-| list with an explicit default, e.g. `[...T] \| *[a, b]` | reset to the shortest prefix of the default that the schema accepts (here `[]`); if only the full non-empty default is accepted, fail | v3 result |
+| list with an explicit default, e.g. `[...T] \| *[a, b]` | reset to `[]` if the schema accepts `[]`; otherwise fail | v3 result for every shape in flamingo and flamingo-commerce |
 | any other default (scalar, enum, reference, struct) | fail with `ErrNullOverridesDefault` | v3 failed too |
 
 The error reads: `config key "flamingo.router.notfound" is null (an unset or empty unquoted %%ENV:X%%, or ~/null)
@@ -212,19 +225,20 @@ item 1.4), and never warnings.
 
 ### Error quality
 
-`cueError` in `area.go` passes only `err.Error()` through. On v0.17.1 that text truncates disjunction errors, which
-occur in 24 of the 28 schemas. For example, YAML `flamingo.router.timeout: 5000` fails on both versions, because YAML
-numbers arrive as floats:
+`cueError` in `area.go` passes only `err.Error()` through, prefixed with one position. On v0.17.1 that text
+truncates disjunction errors, which occur in 24 of the 28 schemas. For example, YAML `flamingo.router.timeout: 5000`
+fails on both versions, because YAML numbers arrive as floats:
 
 ```
 v3: conflicting values (int | *60000) and 5000 (mismatched types int and float)
 v4: flamingo.router.timeout: 2 errors in empty disjunction: (and 2 more errors)
 ```
 
-`errors.Details` does not help on the `MarshalJSON` error, which stays one line. On the error from
-`Validate(cue.Concrete(true))` it prints every branch, for example `flamingo.router.timeout: conflicting values 5E+3
-and int (mismatched types float and int)`, each with the schema file, line and column. That is why the v4 decode
-validates first.
+In v4, `cueError` formats every CUE error with `errors.Details`: the errors from `AddFile`, `BuildInstance`,
+`FillPath` and `MarshalJSON`. That lists every branch with its positions, for example
+`flamingo.router.timeout: conflicting values 5000 and int (mismatched types float and int)` followed by the schema
+position `<import path>.<Type>:line:col`. YAML values have no positions, so an error caused by a YAML value points
+only into the module schema.
 
 ### Cost and dependency surface
 
@@ -236,10 +250,10 @@ Measured with go1.26.5 on linux/amd64:
 | `cuelang.org` packages linked into `framework/config` | 13 | 96 |
 
 - **`go.mod`.** Besides `cuelang.org/go`, it changes `cockroachdb/apd/v2` to `apd/v3` and bumps `golang.org/x/*`.
-- **Module graph.** `go mod graph` and `go.sum` gain `tetratelabs/wazero` (a WebAssembly runtime),
-  `cuelabs.dev/go/oci/ociregistry`, `opencontainers/image-spec` and `coder/websocket`. None of them is linked into the
-  binary, and the release notes say so.
-- **Environment.** `cuecontext.New` reads `CUE_EXPERIMENT` and `CUE_DEBUG`.
+- **Module graph.** `go mod graph` gains `tetratelabs/wazero` (a WebAssembly runtime),
+  `cuelabs.dev/go/oci/ociregistry`, `opencontainers/image-spec` and `coder/websocket`; `go.sum` gains only
+  `ociregistry` and `image-spec`. None of them is linked into the binary, and the release notes say so.
+- **Environment.** `CUE_DEBUG` is ignored (2.2). In v0.17.1, `CUE_EXPERIMENT` only affects formatting.
 - **Runtime cost.** Not measured yet (work item 2.8).
 
 ## Plan
@@ -250,7 +264,7 @@ Measured with go1.26.5 on linux/amd64:
 | --- | --- |
 | Config owner | Maintainer of `framework/config`. Owns the code work items and decides technical choices inside them |
 | Release manager | Tags, release notes, the soak, the GA decision and the v3 support window |
-| Commerce maintainer | The flamingo-commerce migration and release |
+| Commerce maintainer | The flamingo-commerce migration and release, and those of the flamingo modules it depends on (`flamingo.me/graphql`, `flamingo.me/form`, `flamingo.me/pugtemplate`) |
 | Docs owner | The user guide and Readme updates |
 
 The phases run in dependency order. No work item depends on a later phase.
@@ -259,60 +273,80 @@ The phases run in dependency order. No work item depends on a later phase.
 
 | # | Work item | Done when | Owner |
 | --- | --- | --- | --- |
-| 1.1 | `config snapshot` subcommand. It writes one sorted line per area and leaf key with `area`, `key`, the Go type (recursing into `config.Slice` elements) and the SHA-256 of the canonical JSON value (HMAC with `--salt`). It omits `flamingo.os.env`. An area that fails to load becomes one error line | Unit tests cover each rule; the output is byte-stable | Config owner |
-| 1.2 | Baselines: golden snapshots of the reference apps ([Validation](#validation)) and the null-override parity table. Record them after 1.1 and before 1.3 to 1.6 | Committed, and `go test ./...` compares against them | Config owner |
+| 1.1 | `config snapshot` subcommand. The first line is the header `# flamingo config snapshot 1`. Then it writes one sorted line per area and leaf key with `area`, `key`, the Go type as `%T` prints it (package name, no import path), recursing into every nested slice and map (e.g. `config.Slice[map[string]interface {}{n:float64}]`), and the SHA-256 of the canonical JSON value (HMAC with `--salt`). It omits `flamingo.os.env`, `flamingo.cmd.name` and `cmd.name` (their defaults come from the binary name). A child area that fails to load becomes one error line. If the root or the selected area fails, the command exits with the boot error, as every subcommand does | Unit tests cover each rule; the output is byte-stable | Config owner |
+| 1.2 | Baselines: golden snapshots of the reference apps ([Validation](#validation)) and of a migration fixture app, `framework/config/testdata/migrate`, which holds the in-repo `.cue` files and fixture modules with copies of the 5 framework and 3 commerce `::` schemas; and the null-override parity table. Record them after 1.1 and before 1.3 to 1.6 | Committed, and `go test ./...` compares against them | Config owner |
 | 1.3 | Strict `.cue` loading. `loadCueFile` returns parse errors (file:line:col) and open errors other than "does not exist". `load` and `loadConfigFromBasedir` return these errors instead of passing them to `loadLogged`. A non-empty `CONTEXTFILE` entry with no `.yml`, `.yaml` or `.cue` file fails with `ErrContextFileMissing`. YAML loading is unchanged. `--flamingo-config-lenient` brings back skipping and logs each skipped file | Tests cover a malformed root, context, local, child-area and `CONTEXTFILE` `.cue` file, and a missing entry. The goldens are unchanged | Config owner |
 | 1.4 | Legacy-alias failures become errors. The three fatal calls in `checkLegacyConfig` return errors that wrap `ErrLegacyConfigMismatch`, and `loadConfig` returns them. `Area.Flat()` propagates this class of error from child areas; other child errors stay discarded, as today | The parity table and existing tests pass unchanged, and a mismatch still stops `flamingo.App` with the same text | Config owner |
 | 1.5 | Dual-valid framework schemas: colon label paths in silentzap, gotemplate and core/oauth, and the prefixrouter disjunction | The goldens are unchanged | Config owner |
-| 1.6 | Schema probes: a `config.TryModules` test for each of the 9 uncovered packages, plus one test that loads all schema modules together | All 21 schema modules are covered | Config owner |
-| 1.7 | Release notes: the new boot failures, `--flamingo-config-lenient`, `config snapshot`, the v4 timeline and the v3 support window | Published with v3.N | Release manager |
+| 1.6 | Schema probes: a `config.TryModules` test for each of the 8 uncovered packages other than the root package. `servemodule` is unexported and tests are external packages, so the hello-world golden, which boots through `flamingo.App`, covers it. The golden apps with every schema module (1.2) are the all-schemas probe; one `TryModules` call cannot load zap and silentzap together, because both bind `flamingo.Logger` | All 21 schema modules are covered | Config owner |
+| 1.7 | Release notes. They open with: "This minor release can stop apps from booting where config was silently skipped. Before rolling it out, deploy once with `--flamingo-config-lenient` and read the logged skipped files." They cover the new boot failures, `--flamingo-config-lenient`, `config snapshot`, the v4 timeline and the v3 support window | Published with v3.N | Release manager |
+| 1.8 | flamingo-commerce adopts v3.N and commits its integration project's snapshot as a golden in its own repository | Committed; commerce CI compares against it | Commerce maintainer |
 
 **Exit criteria:** `CGO_ENABLED=1 go test -race ./...` is green, the goldens and the parity table are committed and
-pass, a malformed `.cue` file stops the boot and reports its position, and v3.N is tagged.
+pass, a malformed `.cue` file stops the boot and reports its position, v3.N is tagged, and flamingo-commerce's golden
+(1.8) is committed.
 
 ### Phase 2: v4.0.0-rc.1 (v4 branch, CUE v0.17.1)
 
 | # | Work item | Done when | Owner |
 | --- | --- | --- | --- |
-| 2.1 | Module path `flamingo.me/flamingo/v4`; `cuelang.org/go v0.17.1`; `go mod tidy` | Builds together with 2.2 | Config owner |
-| 2.2 | Go API port (table above). Fields of type `*cue.Instance` become `cue.Value`. `cueAstMergeDecls` returns an error instead of making an unchecked type assertion. The `cueast_test.go` fixtures move from `::` to `#` | The `cueast` tests pass with unchanged assertions | Config owner |
+| 2.0 | CI for the `v4` branch: `main.yml` and `golangci-lint.yml` also run on push and pull request to `v4`. Semanticore stays on master for v3.N and v3.M; v4 pre-release tags are cut by hand from `v4`. Scheduled jobs live on master and check out `v4`. At GA, `v4` merges into master, and a `v3` branch with CI and Semanticore carries the support window | A pull request into `v4` runs the full CI | Release manager |
+| 2.1 | Module path `flamingo.me/flamingo/v4`; `cuelang.org/go v0.17.1`; `go mod tidy`. `flamingo.modules.disabled` entries are matched ignoring path elements of the form `vN`, so `flamingo.me/flamingo/v3/core/zap.Module` disables the v4 zap module and a dependency's entries survive its major-version bump. A match that is not exact logs a deprecation warning; an entry that matches no module logs a warning and is otherwise ignored, as on v3 | Builds together with 2.2; tests cover a v3 entry, a v4 entry, a third-party entry across a major-version bump, and an entry that matches no module | Config owner |
+| 2.2 | Go API port (table above). Fields of type `*cue.Instance` become `cue.Value`, and the context is created with `cuecontext.New(cuecontext.CUE_DEBUG(""))`, so the process environment cannot change evaluation. `cueAstMergeDecls` returns an error instead of making an unchecked type assertion, and keeps the `let` clauses of later files at every struct level (v3 aliases in those files survive the merge, so their converted form must too). While merging a later file, it returns `ErrLaterFileReference` when an identifier of that file resolves to a struct field that an earlier file also declares at the same path. The error names file:line:col and reads `v3 did not resolve this reference (it failed, or silently used the default or an empty result); move it into config.cue or replace it with the value v3 used`. The `cueast_test.go` fixtures move from `::` to `#` | The `cueast` tests pass with unchanged assertions. New tests cover a `let` in the second file, top level and nested; `*flamingo.os.env.X \| "d"`, a comprehension and a nested `if` in `config_local.cue` under a schema-declared label; and `CUE_DEBUG=opendef`, which still gives `field not allowed` | Config owner |
 | 2.3 | Package clause: `package flamingo` goes into the modules-disabled, env and purgeNil files, and into every module schema that has none. User files are left alone | `core/auth` builds with its schema unchanged, and a user `.cue` file that reads `flamingo.os.env.X` loads | Config owner |
-| 2.4 | Decode: `Validate(cue.Concrete(true))` with `errors.Details`, then `MarshalJSON` and `json.Unmarshal` | Tests cover non-concrete top-level values and CUE-sourced numeric lists. Errors show every disjunction branch with its position | Config owner |
+| 2.4 | Decode, number text and error text: `MarshalJSON` and `json.Unmarshal`; numbers are filled with v3's digits (guard table); `cueError` formats every CUE error with `errors.Details` | Tests cover non-concrete top-level values and CUE-sourced numeric lists. Interpolating YAML numbers 80, 8080, 3322, 0.5 and 1.5e6 gives v3's strings (`8080`, `1.5E+6`). A YAML value and a `.cue` value that match no disjunct both print every branch with its schema position | Config owner |
 | 2.5 | Null-override check (rule above) | The parity table from 1.2 passes unchanged | Config owner |
 | 2.6 | Strict loading without an opt-out: `--flamingo-config-lenient` is removed | The tests from 1.3 pass | Config owner |
-| 2.7 | Hand-migrate the framework `::` material: 5 schemas, 3 example `.cue` files and the `core/auth/fake/Readme.md` block. Update `framework/config/Readme.md` | The goldens are identical to Phase 1 with an empty allowlist, the `-race` tests are green, and all 21 probes are green | Config owner |
-| 2.8 | Boot-cost benchmark: `config.Load` for hello-world and for an app with many child areas, on v3.N and on the release candidate | The benchmark is committed and its result is in the release notes | Config owner |
-| 2.9 | flamingo-commerce on the release candidate: `::` → `#` in `category`, `checkout` and `product` | Commerce unit and integration tests are green on rc.1, and its integration project's snapshot equals its v3.N baseline | Commerce maintainer |
-| 2.10 | Tag v4.0.0-rc.1. The release notes cover the dependency surface, the CUE environment variables, error-text changes and the loud changes | Tagged | Release manager |
+| 2.7 | Hand-migrate the framework `::` material: 5 schemas, 3 example `.cue` files and the `core/auth/fake/Readme.md` block. Update `framework/config/Readme.md` | The reference-app goldens are byte-identical to Phase 1, the `-race` tests are green, and all 21 probes are green | Config owner |
+| 2.8 | Boot-cost benchmark: `config.Load` for hello-world and for an app with many child areas, on v3.N and on the release candidate | The benchmark is committed. If `config.Load` on the release candidate is more than 2x slower than on v3.N for either app, the Config owner decides before rc.1 whether to optimise or accept it, and the release notes state the numbers | Config owner |
+| 2.9 | Port the flamingo modules that flamingo-commerce depends on (`flamingo.me/graphql`, `flamingo.me/form`, `flamingo.me/pugtemplate`) to `flamingo.me/flamingo/v4` on branches, and tag pre-releases against the release-candidate commit. They import v3's `framework/config`, which does not compile once a build selects CUE v0.17.1 | Each module's tests pass against the release-candidate commit | Commerce maintainer |
+| 2.10 | flamingo-commerce on the release candidate: `::` → `#` in `category`, `checkout` and `product` | Commerce unit and integration tests are green against the release-candidate commit (a pseudo-version), and its integration project's snapshot equals its golden from 1.8 | Commerce maintainer |
+| 2.11 | Tag v4.0.0-rc.1. The release notes cover the dependency surface, that `CUE_DEBUG` is ignored, error-text changes, the loud changes, and that sessions are not shared across majors ([Deployment](#deployment-version-skew-and-rollback)) | Tagged | Release manager |
 
-**Exit criteria:** rc.1 is tagged. Every golden equals its Phase 1 version or has an allowlist entry that the release
-notes justify (the expected allowlist is empty). The parity table and the probes are green, and flamingo-commerce is
-green on rc.1.
+**Exit criteria:** rc.1 is tagged. Every golden except the migration fixture's (checked in 3.1) is byte-identical to
+its Phase 1 version. The parity table and the probes are green, and flamingo-commerce and the modules from 2.9 are
+green on the tagged commit.
 
 ### Phase 3: v3.M tooling, soak and v4.0.0
 
 | # | Work item | Done when | Owner |
 | --- | --- | --- | --- |
-| 3.1 | `config cue-migrate` in v3.M (described below) | For every in-repo `.cue` file and the 8 legacy framework and commerce schemas, the output loads on the release candidate with snapshots equal to the v3.N baselines. Each rewrite has a test. An unresolvable reference makes it refuse and write nothing | Config owner |
+| 3.1 | `config cue-migrate` in v3.M (described below) | A CI job on `v4` runs `config cue-migrate --write --schemas` from the v3.M commit on the migration fixture (1.2), loads the output with the v4 loader, and compares its `config snapshot` with the fixture's golden. Each rewrite has a unit test, including an alias in a later user file, a `.cue` file next to a `.yml` `CONTEXTFILE` entry, a child area with its own module and `.cue` file, and a referenced and an unreferenced non-identifier backquoted label, each in the first and in a later file. An unresolvable reference makes it refuse and write nothing | Config owner |
 | 3.2 | Finalise the user guide with real versions, and check its error table against release-candidate output | Published | Docs owner |
-| 3.3 | Release v3.M, then soak release candidates for at least 4 weeks. Reference apps, flamingo-commerce and known ecosystem modules migrate using the guide. Each migration bug gets a fix and a new release candidate | A soak log is kept in the release tracking issue | Release manager |
-| 3.4 | Scheduled latest-CUE job on the v4 line ([Validation](#validation)) | It runs weekly and reports failures as an issue | Config owner |
+| 3.3 | Release v3.M, then soak release candidates for at least 4 weeks. At least two applications that use `.cue` files, chosen by the Release manager and named in the release tracking issue (for example maintainers' production apps), follow guide steps 1 to 5 on a release candidate and deploy the result to a non-production environment. If two applications are not named by rc.1 + 2 weeks, the Release manager records this in the tracking issue and decides whether GA waits. A bug in `config snapshot` or `config cue-migrate` is fixed in a v3.M patch release, a bug in v4 in a new release candidate; the affected named applications repeat the guide from step 4a, or from step 2 for snapshot bugs | Each named application has empty snapshot diffs in every deployed context, and each result is logged in the release tracking issue | Release manager |
+| 3.4 | Scheduled latest-CUE jobs on the v4 line ([Validation](#validation)), one per repository, running from the default branch and checking out `v4` (2.0); flamingo-commerce's job uses the head of flamingo's `v4` branch | They run weekly, have run once against `v4`, and report failures as issues | Config owner |
 | 3.5 | Tag v4.0.0 and start the v3 support window | The exit criteria below are met | Release manager |
 
-**How `config cue-migrate` works.** It links only CUE v0.0.15 and runs inside the user's application. It parses
-with the parser v3 loads with and prints with the v0.0.15 formatter, which already applies the dual-valid rewrites.
+**How `config cue-migrate` works.** It links only CUE v0.0.15 and runs inside the user's application, so it needs a
+configuration that boots on v3.M. It parses with the v0.0.15 parser using `parser.ParseComments`, applies a copy of
+the unexported `fix` pass of `cue fmt` v0.0.15 (for example templates to patterns and block comments to line
+comments), and prints with the v0.0.15 formatter (label paths, comprehensions). Together these are exactly the
+dual-valid rewrites of `cue fmt` v0.0.15.
 
-- **Definitions.** It renames `Foo :: x` to `#Foo: x` together with every reference, resolving references against
-  the app's own module schemas and all input files at once. It stops and names the reference when a name is
-  undeclared, or is a definition in one place and a regular field in another.
+- **Definitions.** It renames `Foo :: x` to `#Foo: x` together with every reference, resolving references per area,
+  against that area's module schemas and user files (plus the `CONTEXTFILE` files for the root area). It stops and
+  names the reference when a name is undeclared, or is a definition in one place and a regular field in another.
 - **Other rewrites.** `[e for x in y]` becomes `[for x in y {e}]`, `X = e` becomes `let X = e`, and infix `div`,
-  `mod`, `quo` and `rem` become builtin calls. List arithmetic is left to `cue fix` v0.17.1.
-- **Inputs and modes.** One run reads every `config*.cue` in every area's config directory, the `.cue` entries of
-  `CONTEXTFILE`, and any file arguments. A dry run prints a diff. `--write` applies it, and writes nothing if any file
-  fails. `--schemas DIR` writes each module's converted schema, for module authors.
+  `mod`, `quo` and `rem` become builtin calls. Backquoted labels become quoted labels with a field alias, and
+  references to them use the alias or an index. List arithmetic is left to `cue fix` v0.17.1.
+- **Refusals.** It also stops, names the position and writes nothing for a later-file reference that the v4 merge
+  rejects (2.2), and for a backquoted label with no dual-valid spelling: one in a later file at a level that the merge
+  combines with an earlier file (the merge drops quoted labels there), or a bare reference to another file's
+  top-level label.
+- **Inputs and modes.** One run reads every `config*.cue` in every area's config directory, for every `CONTEXTFILE`
+  entry the `<entry without extension>.cue` file if it exists, and any file arguments. A dry run prints a diff.
+  `--write` applies it, and writes nothing if any file fails. `--schemas DIR` writes each module's converted schema to
+  DIR in both modes, for module authors and for apps with their own `CueConfig()`; only `--write` touches config
+  files. After `--write` the app no longer boots on v3.M, so the command cannot run again until the original files are
+  restored.
 
-**Exit criteria (GA):** the soak is complete, no migration bug has been open for 2 weeks, flamingo-commerce and the
-known ecosystem modules have v4-compatible releases, and the guide is final.
+**Exit criteria (GA):** the soak is complete, the named applications' migrations (3.3) are logged, no migration bug
+is open and none was opened during the last 2 weeks of the soak, and the guide is final. flamingo-commerce,
+`flamingo.me/graphql`, `flamingo.me/form`, `flamingo.me/pugtemplate` and the other known ecosystem modules have
+release candidates whose tests pass against the final v4 release candidate, and in flamingo-commerce's integration
+project `go list -deps ./... | grep '^flamingo.me/flamingo/v3/'` prints nothing. Each of them tags its stable release
+requiring v4.0.0 within one week of GA (flamingo-commerce the same day), tracked in the release tracking issue, and
+the guide links them.
 
 ### Timeline
 
@@ -321,9 +355,9 @@ Indicative, in weeks from the start (T):
 | Milestone | Earliest |
 | --- | --- |
 | v3.N released | T+3 |
-| v4.0.0-rc.1 | T+6 |
+| v4.0.0-rc.1 (after the modules of 2.9 are ported) | T+6 |
 | v3.M released; the soak starts | T+9 |
-| v4.0.0 (at least 4 weeks of soak, the last 2 without an open migration bug) | T+13 |
+| v4.0.0 (at least 4 weeks of soak, the last 2 with no migration bug open or opened) | T+13 |
 | End of the v3 support window (security and migration fixes) | v4.0.0 + 6 months |
 
 ## Validation
@@ -331,31 +365,41 @@ Indicative, in weeks from the start (T):
 - **Golden config snapshots.** `config snapshot` output, committed as testdata and compared by `go test ./...`.
   Values are hashed; keys and Go types are in clear text. They cover `examples/hello-world`, `core/auth/example`
   (`CONTEXT` unset and `static`), `core/oauth/example`, `framework/config/testdata/valid` (`CONTEXT` unset and `dev`),
-  an app with every flamingo schema module (a zap and a silentzap variant), and flamingo-commerce's integration test
-  project.
-- **Allowlist of intended differences.** One line per difference, giving area, key and reason. Each entry is reviewed
-  by the config owner and listed in the release notes. The allowlist for v4.0.0 is expected to be empty.
+  and an app with every flamingo schema module (a zap and a silentzap variant). flamingo-commerce keeps the golden of
+  its integration test project in its own repository (1.8). The migration fixture's golden (1.2) is compared by
+  `go test ./...` on the v3 line and, after conversion, by the 3.1 job on `v4`.
+- **One rule for golden differences.** Goldens must stay byte-identical to Phase 1. An intended change is a reviewed
+  commit that updates the golden and adds a release-note entry.
 - **Null-override parity table.** A table-driven test pairs every schema shape in flamingo and flamingo-commerce
   (string, bool, number, enum and reference defaults; lists with non-empty, empty and implicit defaults; structs;
   `*null`; no schema) with every YAML form (quoted and unquoted `%%ENV:X%%` with X unset, empty or set;
   `%%ENV:X%%default%%`; `~`; `null`; absent). Each outcome, an error or a value with its Go type, is recorded on v3.N,
   and v4 must reproduce it.
-- **Per-module schema probe.** A `config.TryModules` test for each module that has a schema, plus one that loads all
-  of them together. A parse-only check is not enough, because two of the 13 failures only show up at build time.
-- **Scheduled latest-CUE job (v4 line).** Every week it runs `go get cuelang.org/go@latest`, `go mod tidy` and
-  `go test ./...` in flamingo and flamingo-commerce, which covers all the checks above. A failure opens an issue but
-  does not block merges. This job is what makes automated CUE upgrades safe again.
-- **Users** run the same snapshot comparison for each deployed context (see the guide).
+- **Per-module schema probe.** A `config.TryModules` test for each module that has a schema. The golden apps with
+  every schema module cover them all together. A parse-only check is not enough, because two of the 13 failures only
+  show up at build time.
+- **Scheduled latest-CUE jobs (v4 line).** Every week a job in each of flamingo and flamingo-commerce runs
+  `go get cuelang.org/go@latest`, `go mod tidy` and `go test ./...`, which covers all the checks above; commerce's job
+  uses the head of flamingo's v4 branch. A failure opens an issue but does not block merges. The jobs give early
+  warning of CUE releases that change results.
+- **Users** run the same snapshot comparison for each deployed context and keep it in their CI (guide steps 5 and 8).
 
 ## Deployment, version skew and rollback
 
 - **Config and binary are one artifact.** Converted `.cue` files are v4-only. A v3.N or later binary rejects them at
   boot. Older v3 binaries silently ignore them.
 - **Rolling and canary deploys.** v3 and v4 instances must not read the same converted `.cue` files. Give externally
-  mounted `CONTEXTFILE` `.cue` files a separate path per major version, or move them to YAML, which means the same on
-  both versions. YAML-only apps can roll out gradually.
-- **Rollback.** Revert the migration commit (config, `go.mod` and imports) and redeploy. The rollback target must be
-  v3.N or later, so that a leftover v4 file fails loudly instead of being dropped.
+  mounted `CONTEXTFILE` `.cue` files a separate path per major version, or move them to YAML on v3 first (that is a
+  config change even on v3, so it needs a new baseline). Configuration-wise, YAML-only apps can roll out gradually.
+- **Sessions.** The module path is part of every gob-registered type name (for example the session data of
+  `core/auth/oauth`, or commerce's checkout context). v3 and v4 instances, and a rollback, cannot read each other's
+  sessions in a shared store (redis, file, cookie) or commerce's Redis context store; the affected users lose their
+  session. Apps accept a session reset at cutover, and the rc.1 release notes (2.11) say so.
+- **Rollback.** Revert the migration commit (config, `go.mod` and imports), point `CONTEXTFILE` back at the v3 copies
+  of externally mounted files (keep them mounted until the v3 support window ends), and redeploy binary and config
+  together. The rollback target must be v3.N or later, without `--flamingo-config-lenient`, so that a leftover v4
+  file fails loudly instead of being dropped. Keep `flamingo.modules.disabled` entries on their v3 paths while a
+  rollback is possible, because v3 ignores `/v4` entries (2.1).
 - **Ordering.** Apps deploy v3.N (or v3.M) to production before they migrate. That way the new loud failures surface
   on v3, where they are cheap to fix.
 
@@ -364,13 +408,19 @@ Indicative, in weeks from the start (T):
 - **Contexts, areas or environments that nobody snapshotted.** Their values are never compared. Strict loading still
   fails loudly there on unparseable files.
 - **Snapshots taken with different environment variables than production.** The null-override check still keeps v4's
-  boot behaviour equal to v3's.
-- **Config that v3 rejected and v4 accepts.** Examples are `v: #A; z: v.c & {zz: 1}` and `package flamingo` in a user
-  file. This only affects config written after the upgrade.
+  boot behaviour equal to v3's. Failures that depend on values, such as closedness inside an `if` branch that only
+  production values enable, show up only in a v4 snapshot taken in the deployment itself; the guide asks for that
+  run, and otherwise they surface in the canary.
+- **Config that v3 rejected and v4 accepts.** Examples are `v: #A; z: v.c & {zz: 1}`, `package flamingo` in the first
+  user file, and an `import` in a later user file. This only affects config written after the upgrade.
 - **Pre-existing, version-neutral hazards that this plan leaves as they are.** An unset quoted `'%%ENV:X%%'` becomes
-  `""` (an empty secret, for example). YAML merge conflicts between files are discarded. The `.cue` merge silently
-  drops quoted and pattern labels and top-level comprehensions in the second and later user files (a dropped `import`
-  fails loudly). YAML integers never satisfy `int`-typed keys. Malformed YAML panics.
+  `""` (an empty secret, for example). YAML merge conflicts between files are discarded. In the second and later user
+  files, the `.cue` merge silently drops quoted and pattern labels, top-level comprehensions, package clauses, and all
+  but the last of repeated labels inside a struct that an earlier file also declares. YAML integers never satisfy
+  `int`-typed keys. Malformed YAML panics.
+- **A newer CUE selected by a user build.** Another dependency, or a dependency bump, can make a user's build select
+  a newer `cuelang.org/go` than v4 was validated with. Flamingo's scheduled job warns maintainers, not users; the guide
+  asks users to keep comparing snapshots in CI.
 - **Code or monitoring that matches CUE error text.**
 
 ## Decisions made
@@ -380,13 +430,14 @@ Indicative, in weeks from the start (T):
 2. **Strict loading comes first.** It ships in v3.N with `--flamingo-config-lenient` as a v3-only opt-out, which v4
    removes. Without it, pre-migrating on v3 or rolling back can silently drop config.
 3. **Numbers stay `float64`.** The decode goes through `MarshalJSON` and `json.Unmarshal`, because native `int64`
-   fails silently in `, ok` type assertions. `Validate(cue.Concrete(true))` runs first, for error quality; it changed
-   no outcome in probes.
+   fails silently in `, ok` type assertions. A preceding `Validate(cue.Concrete(true))` changed no outcome in the
+   null-override parity table or the goldens, and does not improve error text once `cueError` uses `errors.Details`,
+   so it is not used.
 4. **The null-override check reproduces v3.** Accepting v4's resolution instead would turn v3 boot failures into
    silently defaulted values.
 5. **Package clause on generated input only.** `package flamingo` goes into every generated file and into every module
-   schema that lacks one. User files are left alone. A user file's `package flamingo` is accepted, and any other name
-   fails, as on v3.
+   schema that lacks one. User files are left alone. In the first user file, `package flamingo` is accepted and any
+   other name fails, as on v3; in later user files the merge drops package clauses on both versions.
 6. **Legacy-alias mismatches become returned errors, never warnings.** `FlamingoLegacyConfigAlias` stays.
 7. **prefixrouter takes the disjunction rewrite in v3.N.** The `enabled: bool | *false` alternative would add two
    keys, the new one and its legacy mirror, to every app that loads the module.
@@ -398,12 +449,13 @@ Indicative, in weeks from the start (T):
     resolve references. Official `cue fix` is not used: v0.17.1 `cue fix` exits 0 and leaves `::` untouched; v0.2.x
     `cue fix` emits bridge fields (`Foo: #Foo @tmpNoExportNewDef(…)`) that leak config keys and does not terminate on
     recursive definitions; and no version sees definitions that live in Go strings.
-11. **`cueast.go` stays.** Only its unchecked type assertion changes. Its drop behaviour is version-neutral and
-    documented.
-12. **Cut from the plan.** A predictive cross-version tool (a v3 snapshot diffed against a v4 snapshot checks the same
-    thing). A reverse converter (reverting the commit restores v3). A survey or collection gate (there is no channel
-    back from users). A separate `config lint` (strict loading, the `config cue-migrate` dry run and the
-    null-override check cover it). Version-bisect CI tests (the scheduled job replaces them).
+11. **`cueast.go` stays.** 2.2 fixes its unchecked type assertion and keeps `let` clauses from later files, because
+    `config cue-migrate` turns aliases into `let`. Its other drops are the same on both versions. Where identifier
+    resolution in later files differs, the merge rejects the reference (2.2).
+12. **Rejected alternatives.** A predictive cross-version tool (a v3 snapshot diffed against a v4 snapshot checks
+    the same thing). A reverse converter (reverting the commit restores v3). Gating v4 on a survey of users' `.cue`
+    usage (there is no channel back from users). A separate `config lint` (strict loading, the `config cue-migrate`
+    dry run and the null-override check cover it). Version-bisect CI tests (the scheduled job replaces them).
 13. **The deprecated config API stays in v4.0.0.** Removing it needs a separate proposal.
 14. **Soak and support.** The soak runs for at least 4 weeks from v3.M. The v3 support window is 6 months after v4.0.0.
 
@@ -411,8 +463,8 @@ Indicative, in weeks from the start (T):
 
 | Question | Decides |
 | --- | --- |
-| Does flamingo-commerce ship a new major version alongside Flamingo v4, or a minor release that requires it? | Commerce maintainer |
-| Which third-party modules count as "known ecosystem modules" for the GA gate? | Release manager |
+| Do flamingo-commerce, `flamingo.me/graphql`, `flamingo.me/form` and `flamingo.me/pugtemplate` ship new major versions alongside Flamingo v4? Their APIs expose Flamingo types, so a new major is likely. Decide before Phase 2 starts: it sets the import rewrite in guide step 4b | Commerce maintainer |
+| Which other third-party modules count as "known ecosystem modules" for the GA gate? Decide by rc.1 | Release manager |
 | When is the `cueast.go` merge replaced so that its silent drops become errors (after v4.0.0)? | Config owner |
 
 ## Appendix: reproducing the key facts
@@ -448,5 +500,6 @@ go list -deps ./framework/config | grep -c '^cuelang.org'
 go list -deps ./examples/hello-world | grep -E 'wazero|ociregistry|coder/websocket'   # no output
 ```
 
-The probes, parity table and goldens added in Phase 1 reproduce the remaining facts. Run on a v4 branch whose schemas
+The probes, parity table and goldens added in Phase 1 reproduce the remaining flamingo facts; the flamingo-commerce
+facts come from its golden (1.8) and from 2.10. Run on a v4 branch whose schemas
 are not yet migrated, `go test ./...` reports the failing schemas.
