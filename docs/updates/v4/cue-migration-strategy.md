@@ -170,7 +170,8 @@ accepts is listed under [What this plan cannot catch](#what-this-plan-cannot-cat
 
 ### Semantic changes and guards
 
-The v4 decode does not use native `Value.Decode`. It runs `MarshalJSON`, then `json.Unmarshal` into `config.Map`.
+The v4 decode does not use native `Value.Decode`. It runs `Validate(cue.Concrete(true))`, then `MarshalJSON`, then
+`json.Unmarshal` into `config.Map`.
 
 | Change | Trigger | v3 | v4 without guard | Guard | Residual risk |
 | --- | --- | --- | --- | --- | --- |
@@ -178,8 +179,8 @@ The v4 decode does not use native `Value.Decode`. It runs `MarshalJSON`, then `j
 | Null over a schema default | YAML null on a key whose schema has a default: unquoted `%%ENV:X%%` with X unset or empty, `~`, or `null` | Boot error for scalar and struct defaults; `[]` for a non-empty list default | The default is used silently: dozens of defaulted keys without a legacy alias in flamingo (e.g. `flamingo.router.notfound`, `core.serve.port`) and in flamingo-commerce (e.g. `commerce.pagination.defaultPageSize`), and list defaults (`commerce.product.fakeservice.deliveryCodes: ~`). Keys with a legacy alias, such as `flamingo.session.secret`, fail in `checkLegacyConfig` instead | Null-override check (below) | None for any schema shape in flamingo or flamingo-commerce. The hypothetical `{a: string \| *"x"} \| *{a: "y"}` fails where v3 booted, which is loud |
 | Non-concrete top-level value | A top-level user `.cue` field that is not concrete: an unmigrated reference `H: core.auth.http & {…}`, `T: string`, or conflicting top-level defaults | Load error | Decodes to nil, and `Get` reports the key as present | The JSON decode fails with the position | None observed |
 | Integer Go types | Numbers from CUE inside lists (literals, schema defaults) | `float64` | `int64` inside `config.Slice`; scalars are re-normalised by `Map.Add` | JSON decode | None observed |
-| Number text | A YAML, environment or Go-default number used in a CUE interpolation or computed label, e.g. `"http://localhost:\(core.serve.port)/"` with port 8080 | `http://localhost:8080/` | `http://localhost:8.08E+3/`: integral values that end in 0 print in exponent form | Every finite, non-zero `float64` or `float32` of the merged map, at any depth of maps and lists, is filled as a CUE float literal with v3's digits (`strconv.FormatFloat(v, 'g', -1, bits)`, plus `e0` when that has no `.` or exponent). Zero, NaN and ±Inf are filled unchanged, because v0.17.1 reads the literal `-0e0` as NaN (2.4) | Quotients (`/`) still print differently ([Syntax](#syntax)) |
-| Stale references | A reference whose declaration the `.cue` merge drops or replaces. It happens in any user file, `config.cue` included, as soon as a second `.cue` file is loaded: a later file references a struct label that an earlier file also declares; a file declares a top-level label more than once (two `flamingo:` lines); or a later file overrides the scalar it names. E.g. `k: *flamingo.os.env.X \| "d"` in a `config.cue` with two `flamingo:` lines, next to a `config_local.cue` | Fails with `undefined field`, or silently yields the disjunction default, `{}` for a comprehension, or nothing for an `if` | Rebinds the reference to a top-level field of that name (usually the intended one, sometimes a different field), or fails with `reference "x" not found` | After the last user file of an area is merged, the loader re-resolves the merged file and fails with `ErrStaleReference` on every reference still bound to a dropped declaration (2.2). The `config cue-migrate` dry run reports the same on v3.M | v3 aliases in later files whose expression references a field: `config cue-migrate` refuses them, because their `let` form resolves differently |
+| Number text | A YAML, environment or Go-default number used in a CUE interpolation or computed label, e.g. `"http://localhost:\(core.serve.port)/"` with port 8080 | `http://localhost:8080/` | `http://localhost:8.08E+3/`: integral values that end in 0 print in exponent form | Every finite, non-zero `float64` or `float32` of the merged map, at any depth of maps and lists, is filled as a CUE float literal with v3's digits (`strconv.FormatFloat(v, 'g', -1, bits)`, plus `e0` when that has no `.` or exponent). Zero, NaN and ±Inf are filled unchanged: v0.17.1 reads the literal `-0e0` as NaN, and NaN and Inf have no CUE literal (2.4) | Quotients (`/`) still print differently ([Syntax](#syntax)) |
+| Stale references | A reference whose declaration the `.cue` merge drops or replaces. It happens in any user file, `config.cue` included, as soon as a second `.cue` file is loaded: a later file references a struct label that an earlier file also declares; a file declares the referenced top-level label more than once (two `flamingo:` lines); or a reference names a scalar that a later file overrides. E.g. `k: *flamingo.os.env.X \| "d"` in a `config.cue` with two `flamingo:` lines, next to a `config_local.cue` | Fails with `undefined field`, or with `… (found struct)` in an interpolation, or silently yields the disjunction default, `{}` (for a comprehension, or for a reference to an overridden scalar even inside a disjunction), or nothing for an `if` | Rebinds the reference to a top-level field of that name (usually the intended one, sometimes a different field), or fails with `reference "x" not found` or `structural cycle` | After the last user file of an area is merged, the loader re-resolves the merged file and fails with `ErrStaleReference` on every reference still bound to a dropped declaration (2.2). The `config cue-migrate` dry run reports the same on v3.M | v3 aliases in later files whose expression references a field: `config cue-migrate` refuses them, because their `let` form resolves differently |
 | Module path in config | A `flamingo.modules.disabled` entry written for v3 (`flamingo.me/flamingo/v3/…Module`) | The module is disabled | The entry matches no module, and the module stays enabled without a message | An exact match disables the module, as on v3. Otherwise an entry that starts with `flamingo.me/flamingo/v3` followed by `/` or `.` is retried with `v4` in that element; a match logs a deprecation warning, and an entry that still matches no module logs a warning (2.1). `config snapshot` records which modules each area disables (1.1) | A dependency whose module path changed: list its old and new path while a rollback is possible |
 
 **Null-override check.** It runs after `FillPath`, for each key whose merged Go value is nil. That is the same set
@@ -235,13 +236,13 @@ v3: conflicting values (int | *60000) and 5000 (mismatched types int and float)
 v4: flamingo.router.timeout: 2 errors in empty disjunction: (and 2 more errors)
 ```
 
-In v4, `cueError` formats every CUE error with `errors.Details`: the errors from `AddFile`, `BuildInstance`,
+In v4, `cueError` formats every CUE error with `errors.Details`: the errors from parsing, `AddSyntax`, `BuildInstance`,
 `FillPath` and `Validate(cue.Concrete(true))`, which runs before `MarshalJSON`. That lists every branch with its
 positions, for example `flamingo.router.timeout: conflicting values 5000 and int (mismatched types float and int)`
 followed by the schema position `<import path>.<Type>:line:col`. `Validate` also keeps the cause of incomplete values
-that `MarshalJSON` drops (`invalid interpolation: cannot reference optional field: host` instead of a bare
-`invalid interpolation:`), and prints an unresolved disjunction as `incomplete value 1 | 2` rather than internal
-syntax. YAML values have no positions, so an error caused by a YAML value points only into the module schema.
+that `MarshalJSON` drops (`invalid interpolation: cannot reference optional field: host` instead of a bare `invalid
+interpolation:`), and prints an unresolved disjunction as `incomplete value 1 | 2` rather than internal syntax. YAML
+values have no positions, so an error caused by a YAML value points only into the module schema.
 
 ### Cost and dependency surface
 
@@ -298,7 +299,7 @@ pass, a malformed `.cue` file stops the boot and reports its position, v3.N is t
 | --- | --- | --- | --- |
 | 2.0 | CI for the `v4` branch: `main.yml` also runs on push and pull request to `v4`, and `golangci-lint.yml` on push to `v4` (it already runs on every pull request). Semanticore stays on master for v3.N and v3.M; v4 pre-release tags are cut by hand from `v4`. Scheduled jobs live on master and check out `v4` until GA, master after. At GA, `v4` merges into master, and a `v3` branch with CI and Semanticore carries the support window | A pull request into `v4` runs the full CI | Release manager |
 | 2.1 | Module path `flamingo.me/flamingo/v4`; `cuelang.org/go v0.17.1`; `go mod tidy`. `flamingo.modules.disabled`: an entry that names a loaded module exactly disables it, as on v3. Otherwise an entry that starts with `flamingo.me/flamingo/v3` followed by `/` or `.` is retried with `v4` in that element, so `flamingo.me/flamingo/v3/core/requestlogger.Module` disables the v4 module, and a match logs a deprecation warning. An entry that still matches no module logs a warning and has no other effect. Names are computed for pointer and non-pointer modules alike (1.9). Other paths are never rewritten: ignoring every `vN` element would conflate distinct packages such as `api/v1` and `api/v2` (decision 15) | Builds together with 2.2; tests cover a v3 entry, a v4 entry, an unmatched entry in a `WithRoutes` app, and app modules `api/v1` and `api/v2` in both orders | Config owner |
-| 2.2 | Go API port (table above). Fields of type `*cue.Instance` become `cue.Value`, and the context is created with `cuecontext.New(cuecontext.CUE_DEBUG(""))`, so the process environment cannot change evaluation. `cueAstMergeDecls` returns an error instead of making an unchecked type assertion, and keeps the `let` clauses of later files at every struct level (v3 drops aliases in those files from the merge but inlines their expression at each reference, so a constant alias works and its `let` must survive). Stale references: after the last user file of an area is merged (for the root area, after the `CONTEXTFILE` files) and before the first `AddSyntax`, the loader clears the merged file's `Unresolved`, re-runs `astutil.Resolve`, and returns `ErrStaleReference` for every identifier left in `Unresolved` whose `Node` is set and is not an import. It runs once per area, because v0.17.1's build rewrites `Ident.Node` and Flamingo builds the same AST again. The error names file:line:col and reads `this reference points at a declaration that the .cue merge dropped; v3 failed on it or silently used the default or an empty result. Replace it with the value v3 used, or, on v3, declare its top-level label only once in config.cue, reference it from there, and take a new baseline`. The `cueast_test.go` fixtures move from `::` to `#` | The `cueast` tests pass with unchanged assertions. New tests cover a `let` in the second file, top level and nested; `*flamingo.os.env.X \| "d"`, a comprehension and a nested `if` in `config_local.cue` under a schema-declared label; two `flamingo:` lines in `config.cue` next to a `config_local.cue`; a scalar overridden by a later file; no error for a case where v3 and v4 agree (for example an override `a: {y: "2", k: *y \| "fb"}` of `a: y: "1"`); and `CUE_DEBUG=opendef`, which still gives `field not allowed` | Config owner |
+| 2.2 | Go API port (table above). Fields of type `*cue.Instance` become `cue.Value`, and the context is created with `cuecontext.New(cuecontext.CUE_DEBUG(""))`, so the process environment cannot change evaluation. `cueAstMergeDecls` returns an error instead of making an unchecked type assertion, and keeps the `let` clauses of later files at every struct level (v3 drops aliases in those files from the merge but inlines their expression at each reference, so a constant alias works and its `let` must survive). Stale references: after the last user file of an area is merged (for the root area, after the `CONTEXTFILE` files) and before the first `AddSyntax`, the loader clears the merged file's `Unresolved`, re-runs `astutil.Resolve`, and returns `ErrStaleReference` for every identifier left in `Unresolved` whose `Node` is set and is not an import. It runs once per area, because v0.17.1's build rewrites `Ident.Node` and Flamingo builds the same AST again. The error names file:line:col and reads `this reference points at a declaration that the .cue merge dropped; v3 failed on it or silently used the default or an empty result. Replace it with the value v3 used; or, on v3, declare its top-level label only once in config.cue and reference it from there, or set a later override of a referenced scalar in YAML over a default; then take a new baseline`. The `cueast_test.go` fixtures move from `::` to `#` | The `cueast` tests pass with unchanged assertions. New tests cover a `let` in the second file, top level and nested; `*flamingo.os.env.X \| "d"`, a comprehension and a nested `if` in `config_local.cue` under a schema-declared label; two `flamingo:` lines in `config.cue` next to a `config_local.cue`; a scalar overridden by a later file; no error for a case where v3 and v4 agree (for example an override `a: {y: "2", k: *y \| "fb"}` of `a: y: "1"`); and `CUE_DEBUG=opendef`, which still gives `field not allowed` | Config owner |
 | 2.3 | Package clause: `package flamingo` goes into the modules-disabled, env and purgeNil files, and into every module schema that has none. It is inserted as an `ast.Package` declaration into the parsed file, not prepended as a text line, so schema positions keep their own line numbers. User files are left alone | `core/auth` builds with its schema unchanged, a user `.cue` file that reads `flamingo.os.env.X` loads, and a schema error reports the schema string's own line:col | Config owner |
 | 2.4 | Decode, number text and error text: `Validate(cue.Concrete(true))`, then `MarshalJSON` and `json.Unmarshal`; numbers are filled with v3's digits (guard table); `cueError` formats every CUE error with `errors.Details` | Tests cover non-concrete top-level values and CUE-sourced numeric lists. Interpolating YAML numbers 80, 8080, 3322, 0.5 and 1.5e6 gives v3's strings (`8080`, `1.5E+6`); `-0.0`, a Go-default NaN and a `float32` list element keep v3's outcome. A YAML value and a `.cue` value that match no disjunct both print every branch with its schema position, and an interpolation of an unset optional field reports `cannot reference optional field` | Config owner |
 | 2.5 | Null-override check (rule above) | The parity table from 1.2 passes unchanged | Config owner |
@@ -336,11 +337,11 @@ dual-valid rewrites of `cue fmt` v0.0.15.
   `mod`, `quo` and `rem` become builtin calls. Backquoted labels become quoted labels with a field alias, and
   references to them use the alias or an index. List arithmetic is left to `cue fix` v0.17.1.
 - **Refusals.** It also stops, names the position and writes nothing for a stale reference (2.2, same check on the
-  v0.0.15 AST); for a v3 alias at the top level of a later file, or in a struct that an earlier file also declares,
-  whose expression contains an identifier (v3 resolves it against the dropped scope, so `let` would change the
-  result); and for a backquoted label with no dual-valid spelling: one at the top level of a later file or inside a
-  struct that an earlier file also declares (the merge drops quoted labels there), or a bare reference to a
-  backquoted top-level label of a later file.
+  v0.0.15 AST, except identifiers bound to a v3 alias, which the next rule covers); for a v3 alias at the top level of a
+  later file, or in a struct that an earlier file also declares, whose expression references a field (v3 resolves it
+  against the dropped scope, so `let` would change the result); and for a backquoted label with no dual-valid spelling:
+  one at the top level of a later file or inside a struct that an earlier file also declares (the merge drops quoted
+  labels there), or a bare reference to a backquoted top-level label of a later file.
 - **Inputs and modes.** One run reads every `config*.cue` in every area's config directory, for every `CONTEXTFILE`
   entry the `<entry without extension>.cue` file if it exists, and any file arguments. A dry run prints a diff.
   `--write` applies it, and writes nothing if any file fails. `--schemas DIR` writes each module's converted schema to
@@ -348,13 +349,12 @@ dual-valid rewrites of `cue fmt` v0.0.15.
   files. After `--write` the app no longer boots on v3.M, so the command cannot run again until the original files are
   restored.
 
-**Exit criteria (GA):** 3.1 to 3.4 are done, no migration bug is open and none was opened during the last 2 weeks of
-the soak. flamingo-commerce,
-`flamingo.me/graphql`, `flamingo.me/form`, `flamingo.me/pugtemplate` and the other known ecosystem modules have
-release candidates whose tests pass against the final v4 release candidate, and in flamingo-commerce's integration
-project `go list -deps ./... | grep '^flamingo.me/flamingo/v3/'` prints nothing. Each of them tags its stable release
-requiring v4.0.0 within one week of GA (flamingo-commerce the same day), tracked in the release tracking issue, and
-the guide links them.
+**Exit criteria (GA):** 3.1 to 3.4 are done, no migration bug is open and none was opened during the last 2 weeks of the
+soak. flamingo-commerce, `flamingo.me/graphql`, `flamingo.me/form`, `flamingo.me/pugtemplate` and the other known
+ecosystem modules have release candidates whose tests pass against the final v4 release candidate, and in
+flamingo-commerce's integration project `go list -deps ./... | grep '^flamingo.me/flamingo/v3/'` prints nothing. Each of
+them tags its stable release requiring v4.0.0 within one week of GA (flamingo-commerce the same day), tracked in the
+release tracking issue, and the guide links them.
 
 ### Timeline
 
@@ -429,10 +429,10 @@ Indicative, in weeks from the start (T):
   v0.0.15 panics on (`y: 1.5e6, n: y * 2`). This only affects config written after the upgrade.
 - **Pre-existing, version-neutral hazards that this plan leaves as they are.** An unset quoted `'%%ENV:X%%'` becomes
   `""` (an empty secret, for example). YAML merge conflicts between files are discarded. In the second and later user
-  files, the `.cue` merge silently drops package clauses and, at the top level or inside a struct that an earlier file
-  also declares, quoted and pattern labels, comprehensions and embedded structs, and all but the last of repeated
-  struct-valued labels (e.g. `q: s: a: 1` / `q: s: b: 2`). YAML integers never satisfy
-  `int`-typed keys. Malformed YAML panics.
+  files, the `.cue` merge silently drops package clauses; at the top level or inside a struct that an earlier file
+  also declares, quoted and pattern labels, comprehensions and embedded structs; and, inside a struct that an earlier
+  file also declares, all but the last of repeated struct-valued labels (e.g. `q: s: a: 1` / `q: s: b: 2`). YAML
+  integers never satisfy `int`-typed keys. Malformed YAML panics.
 - **A newer CUE selected by a user build.** Another dependency, or a dependency bump, can make a user's build select
   a newer `cuelang.org/go` than v4 was validated with. Flamingo's scheduled job warns maintainers, not users; the guide
   asks users to keep comparing snapshots in CI.
@@ -452,8 +452,8 @@ Indicative, in weeks from the start (T):
    silently defaulted values.
 5. **Package clause on generated input only.** `package flamingo` is inserted as a declaration into every generated
    file and every module schema that lacks one. User files are left alone. In the first user file, `package flamingo`
-   is accepted; any other name fails on v3, and on v4 unless the merge moves a later file's top-level field in front
-   of it. In later user files the merge drops package clauses on both versions.
+   is accepted on v4 (v3 rejects it); any other name fails on v3, and on v4 unless the merge moves a later file's
+   top-level non-struct field in front of it. In later user files the merge drops package clauses on both versions.
 6. **Legacy-alias mismatches become returned errors, never warnings.** `FlamingoLegacyConfigAlias` stays.
 7. **prefixrouter takes the disjunction rewrite in v3.N.** The `enabled: bool | *false` alternative would add two
    keys, the new one and its legacy mirror, to every app that loads the module.
@@ -466,8 +466,9 @@ Indicative, in weeks from the start (T):
     `cue fix` emits bridge fields (`Foo: #Foo @tmpNoExportNewDef(…)`) that leak config keys and does not terminate on
     recursive definitions; and no version sees definitions that live in Go strings.
 11. **`cueast.go` stays.** 2.2 fixes its unchecked type assertion, keeps `let` clauses from later files (because
-    `config cue-migrate` turns aliases into `let`), and rejects stale references, the one place where the two versions
-    resolve the merged file differently. Its other drops are the same on both versions.
+    `config cue-migrate` turns aliases into `let`), and rejects stale references. The other difference in resolving the
+    merged file, v3 aliases in later files that reference a field, is refused by `config cue-migrate` (3.1). Its other
+    drops are the same on both versions.
 12. **Rejected alternatives.** A predictive cross-version tool (a v3 snapshot diffed against a v4 snapshot checks
     the same thing). A reverse converter (reverting the commit restores v3). Gating v4 on a survey of users' `.cue`
     usage (there is no channel back from users). A separate `config lint` (strict loading, the `config cue-migrate`

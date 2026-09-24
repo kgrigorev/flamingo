@@ -88,11 +88,11 @@ snapshot.
 CONTEXT=production go run . config snapshot > snapshot-v3-production.tsv   # (planned)
 ```
 
-- **Format.** The first line is the header `# flamingo config snapshot 1`. Releases before v3.N have no such
-  subcommand and print `snapshot:` and `null` instead. Each further line is one area and key: area, key, Go type and
-  a hash of the value. `flamingo.os.env`, `flamingo.cmd.name` and `cmd.name` are left out. A child area that fails to
-  load appears as a single error line, which is worth fixing now. If the root or the selected area fails, the command
-  stops with the boot error.
+- **Format.** The first line is the header `# flamingo config snapshot 1`. Releases before v3.N have no such subcommand
+  and print `snapshot:` and `null` instead. Each further line is one area and key: area, key, Go type and a hash of the
+  value, plus one line per module that `flamingo.modules.disabled` removes. `flamingo.os.env`, `flamingo.cmd.name` and
+  `cmd.name` are left out. A child area that fails to load appears as a single error line, which is worth fixing now. If
+  the root or the selected area fails, the command stops with the boot error.
 - **Keep snapshots private.** Values are hashed, but low-entropy values such as booleans and ports can be guessed from
   an unsalted hash. To share a snapshot, pass the same `--salt <secret>` for the v3 and the v4 snapshot.
 - **Don't use `config` dumps instead.** They contain every environment variable and secret in clear text.
@@ -162,7 +162,8 @@ The command:
   module that declares it is not part of your app. Add it, or edit that reference by hand using the
   [rename table](#definitions-renamed-in-v4);
 - **also stops** on a reference that the `.cue` merge left pointing at a dropped declaration, on an alias in a later
-  file whose expression references a field, and on a backquoted label that has no spelling for v4 in its file (see
+  file whose expression references a field (replace it with the value v3 used, or move it and the fields that use it
+  into `config.cue`), and on a backquoted label that has no spelling for v4 in its file (see
   [Errors and fixes](#errors-and-fixes)). Fix these on v3 and take a new baseline (step 2) before you convert;
 - **writes**, with `--schemas out/`, every module's converted schema to `out/`, with or without `--write`. Paste your
   own modules' output back into their `CueConfig()` strings in 4b.
@@ -189,12 +190,13 @@ Some constructs need extra care:
 **b. Move to v4 and upgrade your dependencies.**
 
 ```sh
-find . -name '*.go' -not -path './vendor/*' -exec perl -pi -e 's#flamingo\.me/flamingo/v3#flamingo.me/flamingo/v4#g' {} +
+find . -name '*.go' -not -path './vendor/*' \
+  -exec perl -pi -e 's#flamingo\.me/flamingo/v3#flamingo.me/flamingo/v4#g' {} +
 go get flamingo.me/flamingo/v4@v4.0.0
 go get <each Flamingo-based dependency>@<its v4-compatible release>
-go mod tidy && go build ./... && go test ./...   # if you vendor, run go mod vendor after go mod tidy
+go mod tidy && go build ./... && go test ./...   # with vendoring: go mod tidy && go mod vendor && go build ./...
 go list -deps ./... | grep '^flamingo.me/flamingo/v3/'   # must print nothing
-grep -rn 'flamingo.me/flamingo/v3' --exclude-dir=vendor --exclude-dir=.git . | grep -v '\.go:'
+grep -rn 'flamingo.me/flamingo/v3' --exclude-dir=vendor --exclude-dir=.git --exclude=go.sum . | grep -v '\.go:'
 ```
 
 - **References outside Go files.** The last command lists build scripts, `replace` lines and tool configs that still
@@ -230,15 +232,15 @@ diff snapshot-v3-production.tsv snapshot-v4-production.tsv
   unrelated config changes do not show up in the diff.
 
 The diff must be empty for every context. The only accepted lines are changes that a dependency announces in its
-release notes. What a non-empty diff usually means:
+release notes, and quotients in interpolations (below). What a non-empty diff usually means:
 
 | Diff shows | Usual cause |
 | --- | --- |
 | Keys missing, or a different value | A `.cue` file or reference was not converted, or a file for this context was not part of the run in step 4a |
 | A new top-level key named like a definition | `Foo ::` was changed to `Foo:` instead of `#Foo:` |
 | Same value, different Go type | A bug. Report it with the two lines |
-| A different set of disabled modules | A `flamingo.modules.disabled` entry did not match; read the boot log's warnings |
-| A different string where a `.cue` file divides (`/`) inside an interpolation | CUE v0.17.1 prints quotients differently. Write the result as a literal, or accept the new text |
+| A different set of disabled modules | A `flamingo.modules.disabled` entry did not match (read the boot log's warnings), or a dependency's module path changed (expected if you listed its new path in step 4b) |
+| A different value for a key whose `.cue` expression divides (`/`) inside an interpolation | CUE v0.17.1 prints quotients differently. On v3, write the result as a literal and take a new baseline (step 2), or accept the new text |
 | An area error line, or the command stops with a boot error | Read the boot error in that context (see [Errors and fixes](#errors-and-fixes)) |
 
 ### 6. Deploy config and binary together
@@ -298,8 +300,8 @@ Definitions from third-party modules follow the same rule, `Foo` → `#Foo`. Che
    schema, add values that switch them on. `TryModules` also initialises Dingo for your module and its `Depends()`.
    If it fails with a Dingo injection error, or with an incomplete value that comes from a framework key such as
    `flamingo.debug.mode`, add `new(framework.InitModule), new(zap.Module)` to the call (leave out zap if your module
-   binds `flamingo.Logger` itself). Run the test on
-   v3.N or later, and on your v4 branch against a v4.0.0 release candidate.
+   binds `flamingo.Logger` itself). Run the test on v3.N or later, and on your v4 branch against a v4.0.0 release
+   candidate.
 2. **Stay in the dual-valid subset.** These mean the same on v3 and v4: label paths `a: b: c:` (never `a b c:`),
    patterns `[Name=string]:`, `//` comments, leading comprehensions (`for k, v in s {…}`, `if c {…}`), and
    references to other modules' keys (v4 puts all schemas into one package). Avoid two things. Don't put an `if` on
@@ -350,7 +352,7 @@ the key named at the start of the message.
 | `field not allowed` (e.g. `commerce.checkout.placeorder.contextstore.redis.typo: field not allowed`) | A key that the schema does not declare. v3 did not check this in parts of a schema that a switch turns on | Fix or remove the key |
 | `2 errors in empty disjunction:`, followed by lines like `conflicting values 5000 and int (mismatched types float and int)` | The value matches no alternative of the key's schema. Example: a YAML integer for an `int` key, which v3 rejects too | Use a value of the listed type, or set the key in CUE |
 | On v3.N or later: `expected operand, found 'ILLEGAL'` (`#Foo`), `expected selector, found 'ILLEGAL'` (`core.auth.#http`), `expected '{', found 'let'`, `expected operand, found 'for'`, `` expected label or ':', found '!' ``, `expected operand, found 'ATTRIBUTE'` | A v4-only construct in a file loaded by v3 | Deploy the file with the v4 binary, or revert it (for a `CONTEXTFILE` file, point it back at the v3 copy) |
-| `this reference points at a declaration that the .cue merge dropped …` *(planned message)*, in any `.cue` file of an area that loads more than one | The merge replaced what the reference names: a later file references a struct label that an earlier file also declares, a file declares a top-level label more than once (two `flamingo:` lines in `config.cue`), or a later file overrides the scalar it names. v3 failed on it or silently used the default, `{}` or nothing | To keep v3's result, replace the expression with the value v3 used. To use the reference, on v3 declare its top-level label only once in `config.cue` (one `flamingo: {…}` block), reference it from there, and take a new baseline (step 2) |
+| `this reference points at a declaration that the .cue merge dropped …` *(planned message)*, in any `.cue` file of an area that loads more than one | The merge replaced what the reference names: a later file references a struct label that an earlier file also declares, a file declares the referenced top-level label more than once (two `flamingo:` lines in `config.cue`), or a reference names a scalar that a later file overrides. v3 failed on it or silently used the default, `{}` or nothing | To keep v3's result, replace the expression with the value v3 used. To use the reference, on v3 declare its top-level label only once in `config.cue` (one `flamingo: {…}` block) and reference it from there; for a scalar that a later file overrides, make the `config.cue` value a default (`port: *3322 \| number`) and set the override in YAML. Then take a new baseline (step 2) |
 | `config key "…" is null … but its schema default is …` *(planned message)* | An unquoted `%%ENV:X%%` with X unset or empty, `~` or `null`, on a key with a default. v3 refused this too (`cannot convert incomplete value`) | Set the variable, use `%%ENV:X%%default%%`, or remove the key |
 | `CONTEXTFILE entry matches no file: "…"` *(planned message)* | A `CONTEXTFILE` path with no `.yml`, `.yaml` or `.cue` file. v3 releases without strict loading ignored it | Fix the path |
 | `legacy config mismatch for new "…"="…" and old "…"="…"` | A legacy key and its new key are set to different values. This is unchanged from v3 | Set only the new key |
