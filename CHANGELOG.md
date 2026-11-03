@@ -1,5 +1,23 @@
 # Changelog
 
+## Version v3.17.5 (2026-11-03)
+
+### Documentation
+
+- **framework/config:** revise CUE migration RFC and guide for backward compatibility (bf38c3df)
+- **framework/config:** CUE v0.17 migration RFC and user guide for v4 (#9) (11a64194)
+- point Claude Code at use-modern-go skill for Go edits (#6) (4d329952)
+- add CLAUDE.md with build commands and architecture overview (#3) (9ff24c7e)
+
+### Chores and tidying
+
+- **.claude:** disable office-document skills for this project (#8) (983a8502)
+- **.claude:** vendor Superpowers skills as project skills (#7) (d4a2e339)
+- **.claude:** add use-modern-go skill for cloud sessions (#5) (9242bd67)
+- **.claude:** enable Superpowers plugin for cloud sessions (#4) (fb52deba)
+- **deps:** update dependency golangci/golangci-lint to v2.13.2 (#599) (29b9ea88)
+- **deps:** update actions/setup-go action to v7 (#591) (3d0e87b3)
+
 ## Version v3.17.5 (2026-10-21)
 
 Minimum Go version is now 1.26.0 (was 1.25.8). go.mod no longer sets a toolchain.
